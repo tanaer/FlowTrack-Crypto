@@ -801,7 +801,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                 regular_font = ImageFont.truetype(font_path, 16)
                 title_font = ImageFont.truetype(font_path, 24)
                 subtitle_font = ImageFont.truetype(font_path, 20)
-                small_font = ImageFont.truetype(font_path, 14)
+                small_font = ImageFont.truetype(font_path, 16)
             else:
                 # 使用默认字体
                 regular_font = ImageFont.load_default()
@@ -1106,7 +1106,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         for i in range(0, img_width + img_height, 200):  # 减少水印密度
             x = max(0, i - img_height)
             y = max(0, img_height - i)
-            draw.text((x + 50, y + 50), watermark, font=watermark_font, fill=watermark_color)
+            draw.text((x + 150, y + 50), watermark, font=watermark_font, fill=watermark_color)
         
         # 添加免责声明底部水印
         disclaimer = "免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
