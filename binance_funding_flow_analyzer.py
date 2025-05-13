@@ -709,385 +709,671 @@ def get_inline_formats(text):
     
     return segments
 
+def _get_font_for_style(style_params, fonts_dict):
+    """Helper to get font based on style parameters."""
+    if style_params.get('is_bold'):
+        return fonts_dict['bold']
+    if style_params.get('is_italic'): # Assuming italic font is same as regular for now or handled by drawing
+        return fonts_dict['regular']
+    if style_params.get('is_code'):
+        return fonts_dict['code']
+    if style_params.get('is_link'):
+        return fonts_dict['regular'] # Links styled by color, not font typically
+    return fonts_dict['regular']
+
+def _parse_table_content(table_md_lines: List[str]) -> List[List[str]]:
+    """Parses markdown table lines into a list of lists of strings."""
+    parsed_rows = []
+    if not table_md_lines:
+        return []
+
+    for i, line in enumerate(table_md_lines):
+        if i == 1 and re.match(r'^[\|\-\s]+$', line):  # Skip separator line
+            continue
+        if not line.strip().startswith('|') or not line.strip().endswith('|'):
+            continue # Should not happen if parse_markdown is correct
+
+        cells = [cell.strip() for cell in line.split('|')]
+        # Remove empty cells resulting from leading/trailing pipes
+        if len(cells) > 0 and not cells[0]:
+            cells = cells[1:]
+        if len(cells) > 0 and not cells[-1]:
+            cells = cells[:-1]
+        if cells: # Only add if there are actual cells
+            parsed_rows.append(cells)
+    return parsed_rows
+
+
+def _calculate_wrapped_dimensions(
+    parsed_markdown_lines: List[Tuple[str, any, Dict]],
+    fonts: Dict[str, ImageFont.FreeTypeFont],
+    base_image_width: int,
+    temp_draw: ImageDraw.ImageDraw,
+    line_heights_config: Dict[str, int],
+    padding_config: int,
+    line_spacing_config: int,
+    cell_padding_config: int
+):
+    """
+    Calculates content dimensions after text wrapping and prepares wrapped data.
+    Returns a dict: {"content_width": int, "content_height": int, "processed_lines": list}
+    Each item in processed_lines: (type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_lines_data)
+    wrapped_sub_lines_data for text-like: list of strings (the wrapped lines)
+    wrapped_sub_lines_data for table: (list of list of wrapped_cell_lines, final_col_widths)
+    """
+    content_max_x = 0  # Max width reached by any single element
+    current_y_offset = 0
+    processed_lines_output = []
+
+    available_render_width = base_image_width - 2 * padding_config
+
+    for line_idx, (line_type, original_content, params) in enumerate(parsed_markdown_lines):
+        item_width = 0
+        item_height = 0
+        wrapped_sub_lines_data = None
+
+        font_regular = fonts['regular']
+        font_bold = fonts['bold']
+        font_code = fonts['code']
+        
+        if line_type == 'header':
+            level = params.get('level', 1)
+            current_font = fonts['title'] if level == 1 else fonts['h2'] if level == 2 else fonts['h3']
+            item_width = temp_draw.textlength(original_content, font=current_font)
+            item_height = (line_heights_config.get(f'h{level}', line_heights_config['header']) + 
+                           (line_spacing_config if level == 1 else line_spacing_config // 2)) # More space after H1
+            if level == 1: # Extra space for H1 separator line
+                item_height += 7 # 5 for line + 2 for spacing
+            wrapped_sub_lines_data = [original_content]
+        elif line_type in ['text', 'list_item', 'quote']:
+            indent = params.get('indent', 0)
+            prefix_width = 0
+            if line_type == 'list_item':
+                prefix_width = 20 # For bullet/number
+            
+            text_render_width = available_render_width - (indent + prefix_width)
+            
+            # Estimate characters per line
+            avg_char_width = temp_draw.textlength("x", font=font_regular)
+            if avg_char_width == 0: avg_char_width = 8 # Fallback
+            chars_to_wrap = max(10, int(text_render_width / avg_char_width))
+
+            wrapped_lines = []
+            if original_content and isinstance(original_content, str):
+                 wrapped_lines = textwrap.wrap(original_content, width=chars_to_wrap, replace_whitespace=False, drop_whitespace=True)
+            if not wrapped_lines and original_content: # If wrap results in empty but original was not
+                wrapped_lines = [' '] 
+            elif not wrapped_lines and not original_content: # Truly empty line
+                 wrapped_lines = ['']
+
+
+            current_item_max_w = 0
+            for sub_line in wrapped_lines:
+                # Width calculation for mixed inline formats is complex.
+                # For now, estimate based on regular font for simplicity in dimension calculation.
+                # Actual drawing will handle inline formats.
+                sub_line_width = temp_draw.textlength(sub_line, font=font_regular)
+                current_item_max_w = max(current_item_max_w, sub_line_width)
+            
+            item_width = current_item_max_w + indent + prefix_width
+            item_height = (len(wrapped_lines) * line_heights_config[line_type] + 
+                           (len(wrapped_lines) -1 ) * (line_spacing_config // 2) + # Intra-item line spacing
+                           line_spacing_config) # Space after item
+            wrapped_sub_lines_data = wrapped_lines
+            
+            if line_type == 'text' and not original_content.strip(): # Blank line
+                item_height = line_heights_config['blank'] # No extra line_spacing_config
+
+        elif line_type == 'code_block_marker':
+            item_height = 5 + line_spacing_config # Small space for marker rendering logic
+            # Actual code block background is drawn based on code lines between markers
+        
+        elif line_type == 'code': # A single line within a code block
+            # Code lines are typically not wrapped aggressively, but could be if very long
+            text_render_width = available_render_width
+            avg_char_width_code = temp_draw.textlength("x", font=font_code)
+            if avg_char_width_code == 0: avg_char_width_code = 7
+            chars_to_wrap_code = max(20, int(text_render_width / avg_char_width_code))
+            
+            wrapped_code_lines = textwrap.wrap(original_content, width=chars_to_wrap_code)
+            if not wrapped_code_lines: wrapped_code_lines = [' ']
+
+            current_item_max_w = 0
+            for sub_line in wrapped_code_lines:
+                 current_item_max_w = max(current_item_max_w, temp_draw.textlength(sub_line, font=font_code))
+            
+            item_width = current_item_max_w
+            item_height = (len(wrapped_code_lines) * line_heights_config['code'] +
+                           (len(wrapped_code_lines) -1) * (line_spacing_config // 2) + # Intra-item line spacing
+                           line_spacing_config // 2) # Smaller spacing after each code line before block ends
+            wrapped_sub_lines_data = wrapped_code_lines
+
+        elif line_type == 'divider':
+            item_width = available_render_width
+            item_height = line_heights_config['divider'] + line_spacing_config
+        
+        elif line_type == 'table':
+            raw_rows_content = _parse_table_content(original_content)
+            num_rows = len(raw_rows_content)
+            num_cols = max(len(r) for r in raw_rows_content) if raw_rows_content else 0
+
+            final_col_widths = [0] * num_cols
+            wrapped_table_cells_data = [[[] for _ in range(num_cols)] for _ in range(num_rows)]
+
+            if num_cols > 0:
+                # Pass 1: Determine natural width of each cell
+                col_natural_widths = [0] * num_cols
+                for r_idx, row_data in enumerate(raw_rows_content):
+                    for c_idx, cell_text in enumerate(row_data):
+                        if c_idx < num_cols:
+                            font_to_use = font_bold if r_idx == 0 else font_regular
+                            cell_w = temp_draw.textlength(cell_text, font=font_to_use) + 2 * cell_padding_config
+                            col_natural_widths[c_idx] = max(col_natural_widths[c_idx], cell_w)
+                
+                total_natural_table_width = sum(col_natural_widths)
+                
+                # Pass 2: Allocate available_render_width to columns
+                if total_natural_table_width <= available_render_width:
+                    final_col_widths = col_natural_widths
+                else:
+                    # Proportional scaling for columns that need to shrink
+                    # Ensure minimum width for each column (e.g., 50px)
+                    min_col_width = 50 
+                    excess_width = available_render_width - sum(min_col_width for _ in range(num_cols) if col_natural_widths[_] > min_col_width)
+                    
+                    scalable_natural_width = sum(w for w in col_natural_widths if w > min_col_width)
+                    
+                    for c_idx in range(num_cols):
+                        if col_natural_widths[c_idx] <= min_col_width:
+                            final_col_widths[c_idx] = col_natural_widths[c_idx]
+                        elif scalable_natural_width > 0 : # and excess_width > 0:
+                             final_col_widths[c_idx] = max(min_col_width, (col_natural_widths[c_idx] / scalable_natural_width) * excess_width if excess_width > 0 else min_col_width)
+                        else: # All columns are huge, divide equally
+                            final_col_widths[c_idx] = max(min_col_width, available_render_width / num_cols)
+                
+                # Ensure sum of final_col_widths does not exceed available_render_width significantly (due to min_col_width constraints)
+                # This simple normalization might be needed if the above logic makes it too wide.
+                current_total_final_width = sum(final_col_widths)
+                if current_total_final_width > available_render_width and current_total_final_width > 0:
+                    scale_factor = available_render_width / current_total_final_width
+                    final_col_widths = [max(int(w * scale_factor), 30) for w in final_col_widths] # Min 30px hard fallback
+
+
+                # Pass 3: Wrap cell content based on final_col_widths and calculate row heights
+                table_render_height = 0
+                for r_idx, row_data in enumerate(raw_rows_content):
+                    max_wrapped_lines_in_this_row = 1
+                    for c_idx, cell_text in enumerate(row_data):
+                        if c_idx < num_cols:
+                            cell_render_width = final_col_widths[c_idx] - 2 * cell_padding_config
+                            font_to_use = font_bold if r_idx == 0 else font_regular
+                            avg_char_w_cell = temp_draw.textlength("x", font=font_to_use)
+                            if avg_char_w_cell == 0: avg_char_w_cell = 8
+                            
+                            chars_to_wrap_cell = max(1, int(cell_render_width / avg_char_w_cell))
+                            wrapped_cell = textwrap.wrap(cell_text, width=chars_to_wrap_cell)
+                            if not wrapped_cell: wrapped_cell = [' '] # Ensure at least one line for height
+                            
+                            wrapped_table_cells_data[r_idx][c_idx] = wrapped_cell
+                            max_wrapped_lines_in_this_row = max(max_wrapped_lines_in_this_row, len(wrapped_cell))
+                    
+                    table_render_height += max_wrapped_lines_in_this_row * line_heights_config['table_row']
+                    if r_idx < num_rows -1:
+                         table_render_height += line_spacing_config // 2 # spacing between table rows
+
+                item_width = sum(final_col_widths)
+                item_height = table_render_height + line_spacing_config # Space after table
+                wrapped_sub_lines_data = (wrapped_table_cells_data, final_col_widths, raw_rows_content) # Store raw too for drawing
+            else: # No columns
+                item_width = 0
+                item_height = line_spacing_config
+
+        else: # Unknown type or blank line from parse_markdown
+            item_height = line_heights_config['blank']
+
+        content_max_x = max(content_max_x, item_width)
+        current_y_offset += item_height
+        processed_lines_output.append(
+            (line_type, original_content, params, item_width, item_height, wrapped_sub_lines_data)
+        )
+
+    return {
+        "content_width": content_max_x,
+        "content_height": current_y_offset,
+        "processed_lines": processed_lines_output,
+    }
+
 def text_to_image(text, watermark="Telegram: @jin10light"):
     """将Markdown文本转换为图片，并添加水印"""
     try:
         # 解析Markdown
-        parsed_lines = parse_markdown(text)
+        parsed_lines_md = parse_markdown(text)
         
-        # 设置字体和颜色
-        background_color = (255, 255, 255)  # 白色背景
-        text_color = (0, 0, 0)  # 黑色文字
-        watermark_color = (220, 220, 220)  # 更淡的灰色水印
-        highlight_color = (230, 230, 230)  # 代码块背景色
-        quote_color = (100, 100, 100)  # 引用文字颜色
-        table_header_bg = (240, 240, 240)  # 表头背景色
-        table_border = (200, 200, 200)  # 表格边框颜色
-        link_color = (0, 0, 255)  # 链接颜色
-        
-        # 设置字体 (优先使用系统字体)
+        # --- Configuration ---
+        MIN_IMAGE_WIDTH = 800
+        MAX_IMAGE_WIDTH = 2800 # Increased for potentially wide tables
+        DEFAULT_ESTIMATION_WIDTH = 1200
+
+        padding = 25 # Increased padding
+        line_spacing = 6 # Increased line spacing
+        cell_padding = 8 # Table cell padding
+        footer_height = 150  # Increased for more footer space + QR
+
+        background_color = (255, 255, 255)
+        text_color = (30, 30, 30) # Darker text
+        watermark_color = (235, 235, 235) # Lighter watermark
+        highlight_color = (240, 240, 240) # Code block and other highlights
+        quote_color = (80, 80, 80)
+        table_header_bg = (225, 225, 225)
+        table_border_color = (180, 180, 180) # Darker border
+        link_color = (0, 102, 204) # Standard link blue
+
+        line_heights = {
+            'header': 38, 'h1':38, 'h2': 32, 'h3': 28,
+            'text': 22, 'list_item': 22, 'quote': 24,
+            'divider': 15, 'code': 20, 'table_row': 24,
+            'blank': 12
+        }
+
+        # --- Font Setup ---
+        fonts = {}
         try:
-            # 尝试使用常见中文字体
             font_paths = [
-                "AlibabaPuHuiTi-3-55-Regular.ttf",  # 自定义字体
-                "C:/Windows/Fonts/msyh.ttc",        # 微软雅黑
-                "C:/Windows/Fonts/simhei.ttf",      # 黑体
-                "C:/Windows/Fonts/simsun.ttc"       # 宋体
+                "AlibabaPuHuiTi-3-55-Regular.ttf",
+                "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/simsun.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" # Common Linux font
             ]
-            
-            font_path = None
+            chosen_font_path = None
             for path in font_paths:
                 if os.path.exists(path):
-                    font_path = path
-                    logger.info(f"使用字体: {path}")
+                    chosen_font_path = path
+                    logger.info(f"Using font: {path}")
                     break
-                    
-            if font_path:
-                font = ImageFont.truetype(font_path, 16)
-                title_font = ImageFont.truetype(font_path, 24)
-                h2_font = ImageFont.truetype(font_path, 22)
-                h3_font = ImageFont.truetype(font_path, 20)
-                bold_font = ImageFont.truetype(font_path, 16)
-                code_font = ImageFont.truetype(font_path, 14)
-                watermark_font = ImageFont.truetype(font_path, 20)
+            
+            if not chosen_font_path:
+                logger.warning("No preferred system fonts found, using Pillow default.")
+                fonts['regular'] = ImageFont.load_default()
+                fonts['bold'] = ImageFont.load_default()
+                fonts['title'] = ImageFont.load_default()
+                fonts['h2'] = ImageFont.load_default()
+                fonts['h3'] = ImageFont.load_default()
+                fonts['code'] = ImageFont.load_default()
+                fonts['watermark'] = ImageFont.load_default()
             else:
-                raise Exception("未找到可用字体")
-                
+                fonts['regular'] = ImageFont.truetype(chosen_font_path, 18)
+                fonts['bold'] = ImageFont.truetype(chosen_font_path, 18) # Assuming bold variant or rely on draw for faux bold
+                fonts['title'] = ImageFont.truetype(chosen_font_path, 28)
+                fonts['h2'] = ImageFont.truetype(chosen_font_path, 24)
+                fonts['h3'] = ImageFont.truetype(chosen_font_path, 22)
+                fonts['code'] = ImageFont.truetype(chosen_font_path, 16) # Monospace preferred if available
+                fonts['watermark'] = ImageFont.truetype(chosen_font_path, 22)
+
         except Exception as e:
-            logger.warning(f"加载自定义字体失败: {e}，使用默认字体")
-            # 如果找不到系统字体，使用默认字体
-            font = ImageFont.load_default()
-            title_font = ImageFont.load_default()
-            h2_font = font
-            h3_font = font
-            bold_font = font
-            code_font = font
-            watermark_font = font
+            logger.error(f"Font loading failed: {e}. Using Pillow default.", exc_info=True)
+            # Fallback to Pillow's default font if any TrueType loading fails
+            default_font_instance = ImageFont.load_default()
+            fonts = {k: default_font_instance for k in ['regular', 'bold', 'title', 'h2', 'h3', 'code', 'watermark']}
+
+        # --- Dimension Calculation ---
+        # Create a temporary draw object for textlength calls
+        temp_img_for_calc = Image.new('RGB', (1,1), background_color)
+        temp_draw_obj = ImageDraw.Draw(temp_img_for_calc)
+
+        # First pass for width estimation
+        pass1_dims = _calculate_wrapped_dimensions(
+            parsed_markdown_lines=parsed_lines_md, fonts=fonts, base_image_width=DEFAULT_ESTIMATION_WIDTH,
+            temp_draw=temp_draw_obj, line_heights_config=line_heights, padding_config=padding,
+            line_spacing_config=line_spacing, cell_padding_config=cell_padding
+        )
         
-        # 预估图片大小
-        line_height = {
-            'header': 36,  # 标题行高度
-            'h2': 32,
-            'h3': 28,
-            'text': 20,    # 文本行高度
-            'list_item': 20, # 列表项高度
-            'quote': 22,    # 引用高度
-            'divider': 20,  # 分隔线高度
-            'code': 18,     # 代码行高度
-            'table_row': 22, # 表格行高度
-            'blank': 10     # 空行高度
-        }
+        calculated_content_width = pass1_dims["content_width"]
+        image_width = int(min(MAX_IMAGE_WIDTH, max(MIN_IMAGE_WIDTH, calculated_content_width + 2 * padding)))
+
+        # Second pass with the determined image_width to get accurate height and final wrapped data
+        final_calculated_data = _calculate_wrapped_dimensions(
+            parsed_markdown_lines=parsed_lines_md, fonts=fonts, base_image_width=image_width,
+            temp_draw=temp_draw_obj, line_heights_config=line_heights, padding_config=padding,
+            line_spacing_config=line_spacing, cell_padding_config=cell_padding
+        )
         
-        # 计算基本宽度
-        max_line_length = max(len(line[1]) if isinstance(line[1], str) else 0 for line in parsed_lines)
-        max_table_width = 0
-        for line_type, content, _ in parsed_lines:
-            if line_type == 'table' and isinstance(content, list):
-                table_width = max(len(row) for row in content) if content else 0
-                max_table_width = max(max_table_width, table_width)
-        
-        image_width = max(1000, max(max_line_length * 8, max_table_width * 15))
-        
-        # 计算总高度
-        total_height = 0
-        for line_type, content, params in parsed_lines:
-            if line_type == 'header':
-                level = params.get('level', 1)
-                if level == 1:
-                    total_height += line_height['header']
-                elif level == 2:
-                    total_height += line_height['h2']
-                else:
-                    total_height += line_height['h3']
-            elif line_type == 'code_block_marker':
-                total_height += 5  # 代码块标记前后的间距
-            elif line_type == 'code':
-                total_height += line_height['code']
-            elif line_type == 'divider':
-                total_height += line_height['divider']
-            elif line_type == 'table':
-                if isinstance(content, list):
-                    total_height += len(content) * line_height['table_row'] + 10  # 表格行 + 边距
-            elif line_type == 'text' and not content:
-                total_height += line_height['blank']
-            else:
-                total_height += line_height[line_type] if line_type in line_height else line_height['text']
-                
-        # 添加边距和页脚空间
-        padding = 20
-        footer_height = 130  # 为页脚和二维码预留空间
-        image_height = total_height + 2 * padding + footer_height
-        
-        # 创建图片(背景色为白色)
+        image_content_height = final_calculated_data["content_height"]
+        image_height = int(image_content_height + 2 * padding + footer_height)
+        processed_drawing_lines = final_calculated_data["processed_lines"]
+
+        del temp_draw_obj, temp_img_for_calc # Clean up temporary objects
+
+        # --- Image Creation ---
         image = Image.new('RGB', (image_width, image_height), background_color)
         draw = ImageDraw.Draw(image)
-        
-        # 添加淡色背景水印(对角线水印)
-        for i in range(0, image_width + image_height, 300):
-            x1 = max(0, i - image_height)
-            y1 = max(0, image_height - i)
-            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(245, 245, 245))
-            
-        # 绘制文本内容
+
+        # --- Watermark ---
+        # Diagonal watermark
+        try:
+            wm_text_width = draw.textlength(watermark, font=fonts['watermark'])
+            for i in range(-image_height // 2, image_width + image_height //2 , int(wm_text_width * 1.5) ):
+                 draw.text((i, (i*0.3) % image_height ), watermark, font=fonts['watermark'], fill=watermark_color, anchor="lt", angle=30)
+        except Exception as e:
+            logger.warning(f"Could not draw diagonal watermark: {e}")
+            # Fallback simpler watermark if advanced fails
+            for i in range(0, image_width + image_height, 300):
+                x1 = max(0, i - image_height)
+                y1 = max(0, image_height - i) # Basic attempt at diagonal spread
+                if x1 < image_width and y1 < image_height :
+                    draw.text((x1 + 50, y1 + 50), watermark, font=fonts['watermark'], fill=watermark_color)
+
+
+        # --- Drawing Content ---
         y_position = padding
-        in_code_block = False
-        code_block_start_y = 0
         
-        for line_type, content, params in parsed_lines:
-            if line_type == 'code_block_marker':
-                if in_code_block:
-                    # 结束代码块，绘制背景
-                    code_block_height = y_position - code_block_start_y
-                    draw.rectangle((padding - 5, code_block_start_y - 5, 
-                                    image_width - padding + 5, y_position + 5), 
-                                  fill=highlight_color)
-                    y_position += 10  # 代码块结束后额外空间
-                else:
-                    # 开始代码块
-                    code_block_start_y = y_position
-                in_code_block = not in_code_block
-                continue
+        # Code block drawing state
+        in_code_block_drawing = False
+        code_block_rect_start_y = 0
+        code_block_lines_buffer = []
+
+
+        for line_idx, (line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data) in enumerate(processed_drawing_lines):
+            
+            # Handle code block rendering flush
+            if line_type != 'code' and in_code_block_drawing:
+                # Draw the collected code block background and text
+                if code_block_lines_buffer:
+                    # Background for the entire block
+                    first_line_y = code_block_rect_start_y
+                    # Calculate total height of buffered code lines for accurate rectangle
+                    buffered_code_block_h = sum(lh for _,_,_,lh,_,_ in code_block_lines_buffer)
+                    
+                    draw.rectangle(
+                        (padding - 5, first_line_y - (line_spacing//2) , 
+                         image_width - padding + 5, first_line_y + buffered_code_block_h - (line_spacing//2) + 5), # Adjusted Y end
+                        fill=highlight_color
+                    )
+                    # Draw each line of code text
+                    temp_y_for_code = first_line_y
+                    for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                        if code_l_wrapped and isinstance(code_l_wrapped, list):
+                             for sub_code_line in code_l_wrapped:
+                                draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                                temp_y_for_code += line_heights['code'] + (line_spacing // 2) # Uses line height for 'code'
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height
                 
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
             if line_type == 'header':
                 level = params.get('level', 1)
+                current_font = fonts['title'] if level == 1 else fonts['h2'] if level == 2 else fonts['h3']
+                text_content = wrapped_sub_data[0] if wrapped_sub_data else ""
+                draw.text((padding, y_position), text_content, font=current_font, fill=text_color)
                 if level == 1:
-                    # 主标题加粗突出
-                    draw.text((padding, y_position), content, font=title_font, fill=text_color)
-                    # 在标题下方添加分隔线
-                    y_position += line_height['header'] - 5
-                    draw.line((padding, y_position, image_width - padding, y_position), 
-                              fill=table_border, width=2)
-                    y_position += 5
-                elif level == 2:
-                    # 二级标题前添加空间
-                    y_position += 5
-                    draw.text((padding, y_position), content, font=h2_font, fill=text_color)
-                    y_position += line_height['h2']
-                else:
-                    draw.text((padding, y_position), content, font=h3_font, fill=text_color)
-                    y_position += line_height['h3']
-                    
-            elif line_type == 'text':
-                if not content:
-                    y_position += line_height['blank']
-                    continue
-                    
-                # 处理内联格式
-                segments = get_inline_formats(content)
-                x_pos = padding
-                
-                for segment in segments:
-                    if isinstance(segment, tuple):
-                        if segment[0] == 'text':
-                            # 确保内容不为空
-                            if segment[1].strip():
-                                seg_width = draw.textlength(segment[1], font=font)
-                                draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
-                                x_pos += seg_width
-                        elif segment[0] == 'bold':
-                            if segment[1].strip():
-                                seg_width = draw.textlength(segment[1], font=bold_font)
-                                draw.text((x_pos, y_position), segment[1], font=bold_font, fill=text_color)
-                                x_pos += seg_width
-                        elif segment[0] == 'italic':
-                            if segment[1].strip():
-                                seg_width = draw.textlength(segment[1], font=font)
-                                # 模拟斜体效果
-                                draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
-                                x_pos += seg_width
-                        elif segment[0] == 'inline_code':
-                            if segment[1].strip():
-                                # 绘制内联代码背景
-                                seg_width = draw.textlength(segment[1], font=code_font)
-                                draw.rectangle((x_pos - 2, y_position - 2, 
-                                               x_pos + seg_width + 2, y_position + line_height['text'] - 2), 
-                                              fill=highlight_color)
-                                draw.text((x_pos, y_position), segment[1], font=code_font, fill=text_color)
-                                x_pos += seg_width + 4
-                        elif segment[0] == 'link':
-                            if segment[1].strip():
-                                seg_width = draw.textlength(segment[1], font=font)
-                                draw.text((x_pos, y_position), segment[1], font=font, fill=link_color)
-                                x_pos += seg_width
-                            
-                y_position += line_height['text']
-                    
-            elif line_type == 'list_item':
-                indent = params.get('indent', 0)
-                list_type = params.get('type', 'bullet')
-                x_indent = padding + indent + 20
-                
-                # 绘制列表项标记
-                if list_type == 'bullet':
-                    # 绘制圆点
-                    bullet_radius = 3
-                    bullet_y = y_position + line_height['list_item'] // 2
-                    draw.ellipse((padding + indent + 5 - bullet_radius, bullet_y - bullet_radius, 
-                                padding + indent + 5 + bullet_radius, bullet_y + bullet_radius), 
-                               fill=text_color)
-                
-                # 绘制列表项文本
-                draw.text((x_indent, y_position), content, font=font, fill=text_color)
-                y_position += line_height['list_item']
-                    
-            elif line_type == 'quote':
-                # 绘制引用竖线
-                draw.rectangle((padding, y_position, padding + 3, y_position + line_height['quote']),
-                             fill=quote_color)
-                # 绘制引用文本
-                draw.text((padding + 10, y_position), content, font=font, fill=quote_color)
-                y_position += line_height['quote']
-                    
-            elif line_type == 'divider':
-                # 绘制分隔线
-                line_y = y_position + line_height['divider'] // 2
-                draw.line((padding, line_y, image_width - padding, line_y), fill=text_color, width=1)
-                y_position += line_height['divider']
-                    
-            elif line_type == 'code':
-                # 绘制代码行
-                draw.text((padding, y_position), content, font=code_font, fill=text_color)
-                y_position += line_height['code']
-                    
-            elif line_type == 'table' and isinstance(content, list) and len(content) > 1:
-                # 处理表格
-                rows = []
-                for row in content:
-                    if '|' in row:
-                        cells = [cell.strip() for cell in row.split('|')]
-                        # 移除空单元格（表格行首尾的|会产生空单元格）
-                        if not cells[0]:
-                            cells = cells[1:]
-                        if not cells[-1]:
-                            cells = cells[:-1]
-                        rows.append(cells)
-                
-                if rows:
-                    col_count = max(len(row) for row in rows)
-                    col_width = (image_width - 2 * padding) // col_count
-                    
-                    # 绘制表格
-                    for i, row in enumerate(rows):
-                        row_y = y_position
-                        
-                        # 表头背景 - 使用更深的颜色
-                        if i == 0:
-                            table_header_color = (230, 230, 230)  # 更深的灰色
-                            draw.rectangle((padding, row_y, image_width - padding, 
-                                           row_y + line_height['table_row']),
-                                         fill=table_header_color)
-                            
-                            # 在表头文字加粗处理
-                            for j, cell in enumerate(row):
-                                if j < col_count:  # 确保不超出列数
-                                    cell_x = padding + j * col_width
-                                    draw.text((cell_x + 5, row_y + 2), cell, font=bold_font, fill=text_color)
-                        
-                        # 非表头行 - 普通文本
-                        else:    
-                            # 使用交替的背景色提高可读性
-                            if i % 2 == 0:  # 偶数行使用浅灰色背景
-                                draw.rectangle((padding, row_y, image_width - padding,
-                                              row_y + line_height['table_row']),
-                                             fill=(248, 248, 248))
-                            
-                            # 绘制单元格内容
-                            for j, cell in enumerate(row):
-                                if j < col_count:  # 确保不超出列数
-                                    cell_x = padding + j * col_width
-                                    # 根据内容类型使用特殊颜色 (如上涨绿色，下跌红色等)
-                                    cell_color = text_color
-                                    if any(kw in cell.lower() for kw in ['看涨', '做多', '上涨', '突破']):
-                                        cell_color = (0, 130, 0)  # 绿色
-                                    elif any(kw in cell.lower() for kw in ['看跌', '做空', '下跌', '暴跌']):
-                                        cell_color = (200, 0, 0)  # 红色
-                                    elif any(kw in cell.lower() for kw in ['警示', '风险', '异常']):
-                                        cell_color = (180, 80, 0)  # 橙色警告
-                                        
-                                    draw.text((cell_x + 5, row_y + 2), cell, font=font, fill=cell_color)
-                        
-                        # 只在第一行绘制表格横线
-                        if i == 0 or i == len(rows) - 1:
-                            draw.line((padding, row_y, image_width - padding, row_y), 
-                                     fill=table_border, width=1)
-                        
-                        y_position += line_height['table_row']
-                    
-                    # 最后一行的底线
-                    draw.line((padding, y_position, image_width - padding, y_position), 
-                              fill=table_border, width=1)
-                    
-                    # 绘制表格竖线
-                    for j in range(col_count + 1):
-                        col_x = padding + j * col_width
-                        draw.line((col_x, y_position - len(rows) * line_height['table_row'], 
-                                  col_x, y_position), fill=table_border, width=1)
-                        
-                    y_position += 10  # 表格后添加一些空间
-        
-        # 添加页脚和二维码
-        footer_y = y_position + 20
-        
-        # 绘制页脚分隔线
-        draw.line((padding, footer_y, image_width - padding, footer_y), 
-                  fill=table_border, width=1)
-                  
-        # 添加注释信息
-        footnote = "注: 所有时间均为UTC时间，价格单位为USDT。数据截止2025-05-13 22:09:59，实际交易需结合实时数据验证。"
-        draw.text((padding, footer_y + 10), footnote, font=font, fill=(100, 100, 100))
-        
-        # 添加免责声明
-        disclaimer = "*免责声明: 本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
-        draw.text((padding, footer_y + 35), disclaimer, font=font, fill=(100, 100, 100))
+                    # Separator line for H1
+                    sep_y = y_position + line_heights['h1'] + (line_spacing // 2)
+                    draw.line((padding, sep_y, image_width - padding, sep_y), fill=table_border_color, width=2)
             
-        # 添加Telegram标识和二维码
+            elif line_type == 'text' or line_type == 'quote' or line_type == 'list_item':
+                current_x = padding
+                indent_val = params.get('indent', 0)
+                current_x += indent_val
+
+                if line_type == 'quote':
+                    # Draw quote bar
+                    draw.rectangle((padding, y_position, padding + 4, y_position + item_calc_height - line_spacing), 
+                                   fill=quote_color)
+                    current_x += 10 # Indent text for quote
+
+                if line_type == 'list_item':
+                    bullet_radius = 3
+                    bullet_y_center = y_position + line_heights['list_item'] // 2
+                    # Draw bullet point (simple circle for now)
+                    draw.ellipse((current_x, bullet_y_center - bullet_radius,
+                                  current_x + 2 * bullet_radius, bullet_y_center + bullet_radius),
+                                 fill=text_color)
+                    current_x += 15 # Space after bullet
+
+                current_line_y = y_position
+                if wrapped_sub_data and isinstance(wrapped_sub_data, list):
+                    for sub_line_text in wrapped_sub_data:
+                        # Apply inline formatting for this sub_line_text
+                        segments = get_inline_formats(sub_line_text)
+                        x_draw_cursor = current_x
+                        for seg_idx, segment_info in enumerate(segments):
+                            seg_type, seg_text = segment_info[0], segment_info[1]
+                            seg_params = segment_info[2] if len(segment_info) > 2 else {}
+                            
+                            inline_font = fonts['regular']
+                            inline_fill_color = text_color
+
+                            if seg_type == 'bold': inline_font = fonts['bold']
+                            elif seg_type == 'italic': pass # Pillow doesn't have simple italic toggle, use regular
+                            elif seg_type == 'inline_code':
+                                inline_font = fonts['code']
+                                # Draw background for inline code
+                                code_text_w = draw.textlength(seg_text, font=inline_font)
+                                code_text_h = line_heights['text'] # Approx
+                                draw.rectangle(
+                                    (x_draw_cursor - 2, current_line_y - 1,
+                                     x_draw_cursor + code_text_w + 2, current_line_y + code_text_h - 3),
+                                    fill=highlight_color
+                                )
+                            elif seg_type == 'link': inline_fill_color = link_color
+                            
+                            if seg_text.strip(): # Only draw if there's actual text
+                                draw.text((x_draw_cursor, current_line_y), seg_text, font=inline_font, fill=inline_fill_color)
+                                x_draw_cursor += draw.textlength(seg_text, font=inline_font)
+                        
+                        current_line_y += line_heights[line_type] + (line_spacing // 2)
+            
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+
+
+        # --- Footer ---
+        actual_content_end_y = y_position # This should be the end of all drawn content
+        footer_start_y = max(actual_content_end_y + line_spacing, image_height - footer_height + padding)
+
+
+        draw.line((padding, footer_start_y, image_width - padding, footer_start_y), 
+                  fill=table_border_color, width=1)
+        footer_text_y = footer_start_y + 10
+
+        # Date and disclaimer
+        current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC') # Use UTC or specify timezone
+        footnote_text = f"注: 所有时间均为UTC时间，价格单位为USDT。数据截止 {current_time_str}，实际交易需结合实时数据验证。"
+        
+        # Wrap footnote
+        avg_char_w_footer = draw.textlength("x", font=fonts['regular'])
+        if avg_char_w_footer == 0: avg_char_w_footer = 8
+        footer_wrap_chars = max(10, int((image_width - 2 * padding) / avg_char_w_footer))
+        wrapped_footnote = textwrap.wrap(footnote_text, width=footer_wrap_chars)
+
+        for line in wrapped_footnote:
+            draw.text((padding, footer_text_y), line, font=fonts['regular'], fill=(100,100,100))
+            footer_text_y += line_heights['text'] # Use text line height
+
+        footer_text_y += (line_spacing // 2)
+        disclaimer_text = "*免责声明: 本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险。"
+        wrapped_disclaimer = textwrap.wrap(disclaimer_text, width=footer_wrap_chars)
+        for line in wrapped_disclaimer:
+            draw.text((padding, footer_text_y), line, font=fonts['regular'], fill=(100,100,100))
+            footer_text_y += line_heights['text']
+        
+        # QR Code and Telegram Info (Right side of footer)
+        qr_available_width = image_width // 3 # Allocate space for QR + text
+        qr_text_x_start = image_width - padding - qr_available_width
+        qr_y_start = footer_start_y + 10
+
         try:
             import qrcode
-            qr_data = "https://t.me/jin10light"
-            qr = qrcode.QRCode(
-                version=1,
-                error_correction=qrcode.constants.ERROR_CORRECT_L,
-                box_size=10,
-                border=2,
-            )
+            qr_data = "https://t.me/jin10light" # Example URL
+            qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=8, border=2)
             qr.add_data(qr_data)
             qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA") # Ensure RGBA for transparency if needed
             
-            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_max_size = footer_height - 40 # Max size for QR
+            qr_img = qr_img.resize((min(qr_max_size, 100), min(qr_max_size, 100)), Image.Resampling.LANCZOS) # Keep it reasonable
             
-            # 调整二维码大小
-            qr_size = 80
-            qr_img = qr_img.resize((qr_size, qr_size))
+            qr_actual_size = qr_img.width
             
-            # 计算二维码位置 (右下角)
-            qr_x = image_width - qr_size - padding
-            qr_y = footer_y + 10
-            
-            # 粘贴二维码
-            image.paste(qr_img, (qr_x, qr_y))
-            
-            # 在二维码旁边添加文字说明
-            tg_text = "Telegram: @jin10light"
-            tg_text_width = draw.textlength(tg_text, font=font)
-            draw.text((qr_x - tg_text_width - 10, qr_y + qr_size//2 - 10), 
-                      tg_text, font=font, fill=text_color)
-            
-        except Exception as e:
-            logger.error(f"添加二维码失败: {e}")
-            # 添加Telegram文本
-            tg_text = "Telegram: @jin10light"
-            draw.text((image_width - padding - 200, footer_y + 20), 
-                      tg_text, font=font, fill=text_color)
+            qr_paste_x = image_width - padding - qr_actual_size
+            qr_paste_y = qr_y_start
+            image.paste(qr_img, (qr_paste_x, qr_paste_y), qr_img if qr_img.mode == 'RGBA' else None)
 
-        # 将图片保存到内存缓冲区
+            tg_text = "Telegram: @jin10light"
+            tg_text_w = draw.textlength(tg_text, font=fonts['regular'])
+            tg_text_x = qr_paste_x - tg_text_w - 10 # To the left of QR
+            tg_text_y = qr_paste_y + qr_actual_size // 2 - (line_heights['text'] //2) 
+            
+            if tg_text_x < padding: # If text would overflow left, place below QR
+                 tg_text_x = qr_paste_x
+                 tg_text_y = qr_paste_y + qr_actual_size + 5
+
+            draw.text((tg_text_x, tg_text_y), tg_text, font=fonts['regular'], fill=text_color)
+
+        except ImportError:
+            logger.warning("qrcode library not installed. Skipping QR code.")
+            tg_text_fallback = "Telegram: @jin10light (QR disabled)"
+            draw.text((qr_text_x_start, qr_y_start + 20), tg_text_fallback, font=fonts['regular'], fill=text_color)
+        except Exception as e:
+            logger.error(f"Failed to generate or place QR code: {e}", exc_info=True)
+            tg_text_fallback = "Telegram: @jin10light (QR error)"
+            draw.text((qr_text_x_start, qr_y_start + 20), tg_text_fallback, font=fonts['regular'], fill=text_color)
+
+
+        # --- Save to Buffer ---
         buffer = io.BytesIO()
         image.save(buffer, format='PNG')
         buffer.seek(0)
-        
         return buffer
+
     except Exception as e:
-        logger.error(f"文本转图片失败: {e}", exc_info=True)
-        return None
+        logger.error(f"Text to image conversion failed: {e}", exc_info=True)
+        # Create a simple error image
+        try:
+            err_img = Image.new('RGB', (600, 100), (255,200,200))
+            err_draw = ImageDraw.Draw(err_img)
+            err_font = ImageFont.load_default()
+            err_draw.text((10,10), "Error generating image.", font=err_font, fill=(0,0,0))
+            err_draw.text((10,30), str(e)[:80], font=err_font, fill=(0,0,0))
+            err_buffer = io.BytesIO()
+            err_img.save(err_buffer, format='PNG')
+            err_buffer.seek(0)
+            return err_buffer
+        except: # Ultimate fallback
+             return None
 
 
 async def send_telegram_message_async(message, as_image=True):
