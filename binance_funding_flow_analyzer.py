@@ -596,30 +596,30 @@ def send_to_deepseek(data):
 
     # 构建提示文本
     prompt = (
-            "## Binance资金流向专业分析任务\n\n"
-            "我已收集了Binance现货和期货市场过去50根5分钟K线的资金流向数据（已剔除最新未完成的一根），包括：\n"
-            "- 各交易对的资金流向趋势分析\n"
-            "- 价格所处阶段预测（顶部、底部、上涨中、下跌中、整理中）\n"
-            "- 订单簿数据（买卖盘不平衡度）\n"
-            "- 资金压力分析\n"
-            "- 异常交易检测\n\n"
+            "## 资金流向专业分析任务\n\n"
+            "我已收集了现货和期货市场过去50根5分钟K线的资金流向数据（已剔除最新未完成的一根），包括：\n"
+            "- 资金流向趋势，各交易对的资金流向趋势分析\n"
+            "- 价格阶段预测，基于技术指标（如移动平均线、价格波动范围）预测顶部、底部、上涨中、下跌中、整理中\n"
+            "- 订单簿数据，买卖盘不平衡度\n"
+            "- 资金压力分析，买卖压力强度（量化买卖单金额对比）\n"
+            "- 异常交易检测，交易量或价格异常波动（如突增超2倍标准差）\n\n"
 
             "请从专业交易员和机构投资者角度进行深度分析：\n\n"
 
             "1. **主力资金行为解读**：\n"
             "   - 通过资金流向趋势变化，识别主力资金的建仓、出货行为\n"
             "   - 结合订单簿数据，分析主力资金的意图（吸筹、出货、洗盘等）\n"
-            "   - 特别关注资金流向与价格变化不匹配的异常情况\n\n"
+            "   - 特别关注资金流向与价格变化不匹配的异常情况（如资金流入但价格下跌），分析潜在原因（如洗盘或假突破）\n\n"
 
             "2. **价格阶段判断**：\n"
             "   - 根据资金流向趋势和价格关系，判断各交易对处于什么阶段（顶部、底部、上涨中、下跌中、整理中等）\n"
-            "   - 提供判断的置信度和依据\n"
+            "   - 提供判断的置信度（基于资金流向一致性和技术指标）及量化依据（如价格突破前高）\n"
             "   - 对比不同交易对的阶段差异，分析可能的轮动关系\n\n"
 
             "3. **短期趋势预判**：\n"
             "   - 基于资金流向和资金压力分析，预判未来4-8小时可能的价格走势\n"
             "   - 识别可能的反转信号或趋势延续信号\n"
-            "   - 关注异常交易数据可能暗示的短期行情变化\n\n"
+            "   - 关注异常交易数据可能暗示的短期行情变化，分析潜在催化剂（如机构买入或卖出，如果你可以联网的情况下还可以参考市场新闻）\n\n"
 
             "4. **交易策略建议**：\n"
             "   - 针对每个交易对，给出具体的交易建议（观望、做多、做空、减仓等）\n"
@@ -820,102 +820,148 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         soup = BeautifulSoup(html, 'html.parser')
         
         # 计算图像大小
-        padding = 20
-        line_height = 24
+        padding = 30  # 增加内边距
+        line_height = 28  # 增加行高，改善中文排版
         
         # 创建临时图像用于测量文本大小
         temp_img = Image.new('RGB', (1, 1), background_color)
         draw = ImageDraw.Draw(temp_img)
         
         # 估算宽度和高度
-        max_width = 800
+        max_width = 1200  # 增加最大宽度
         total_height = 0
         
+        # 预处理表格内容
+        tables = soup.find_all('table')
+        table_column_widths = []
+        
+        for table in tables:
+            # 计算表格每列的最大宽度
+            rows = table.find_all('tr')
+            if not rows:
+                continue
+                
+            # 找出最大列数
+            max_cols = max(len(row.find_all(['th', 'td'])) for row in rows)
+            column_widths = [0] * max_cols
+            
+            # 计算每列内容的最大宽度
+            for row in rows:
+                cells = row.find_all(['th', 'td'])
+                for i, cell in enumerate(cells):
+                    if i < max_cols:
+                        text_width = draw.textlength(cell.text.strip(), font=regular_font)
+                        column_widths[i] = max(column_widths[i], text_width)
+            
+            # 确保每列至少有100像素宽度
+            column_widths = [max(w + 30, 100) for w in column_widths]  # 添加30像素的内边距
+            table_column_widths.append(column_widths)
+        
+        # 估算总高度
         for element in soup.find_all(['h1', 'h2', 'h3', 'p', 'ul', 'ol', 'table', 'pre']):
             if element.name.startswith('h'):
                 level = int(element.name[1])
                 font = title_font if level == 1 else subtitle_font
                 text_width = draw.textlength(element.text, font=font)
                 max_width = max(max_width, text_width + 2 * padding)
-                total_height += line_height * (1.5 if level == 1 else 1.3)
+                total_height += line_height * (1.8 if level == 1 else 1.5)  # 增加标题行高
             elif element.name == 'p':
                 # 段落文本分行
                 text = element.text
-                wrapped_text = textwrap.wrap(text, width=70)  # 假设约70个字符宽度
+                wrapped_text = textwrap.wrap(text, width=100)  # 增加每行字符数
                 total_height += len(wrapped_text) * line_height
             elif element.name == 'table':
                 # 表格高度估算
                 rows = element.find_all('tr')
                 total_rows = len(rows)
-                total_height += total_rows * line_height * 1.5 + 20  # 表格行加额外空间
+                # 增加表格行高和表格间距
+                total_height += total_rows * line_height * 1.8 + 40
             elif element.name in ('ul', 'ol'):
                 # 列表项
                 items = element.find_all('li')
-                total_height += len(items) * line_height * 1.2
+                total_height += len(items) * line_height * 1.2 + 20
             elif element.name == 'pre':
                 # 代码块
                 code_lines = element.text.strip().split('\n')
-                total_height += len(code_lines) * line_height + 20
+                total_height += len(code_lines) * line_height + 30
         
         # 添加页脚空间
-        total_height += 100
+        total_height += 150
         
-        # 创建图像
-        img_width = max(max_width, 800)
+        # 创建图像 - 确保宽度足够
+        img_width = max(max_width, 1200)  # 最小宽度1200像素
         img_height = int(total_height + 2 * padding)
         image = Image.new('RGB', (img_width, img_height), background_color)
         draw = ImageDraw.Draw(image)
         
         # 绘制内容
         y_position = padding
+        table_index = 0
         
         for element in soup.find_all(['h1', 'h2', 'h3', 'p', 'ul', 'ol', 'table', 'pre']):
             if element.name.startswith('h'):
                 level = int(element.name[1])
                 font = title_font if level == 1 else subtitle_font
+                # 增加标题间距
+                if y_position > padding:
+                    y_position += 15
+                
                 draw.text((padding, y_position), element.text, font=font, fill=title_color)
-                y_position += line_height * (1.5 if level == 1 else 1.3)
+                y_position += line_height * (1.8 if level == 1 else 1.5)
                 
                 # 为h1添加下划线
                 if level == 1:
                     draw.line([(padding, y_position - 5), (img_width - padding, y_position - 5)], 
-                             fill=table_border_color, width=1)
+                             fill=table_border_color, width=2)
+                    y_position += 10  # 标题下方增加间距
             
             elif element.name == 'p':
                 text = element.text
-                wrapped_text = textwrap.wrap(text, width=70)
+                wrapped_text = textwrap.wrap(text, width=100)  # 增加每行字符数
                 for line in wrapped_text:
                     draw.text((padding, y_position), line, font=regular_font, fill=text_color)
                     y_position += line_height
-                y_position += 5  # 段落间距
+                y_position += 10  # 段落间距增加
             
             elif element.name == 'table':
                 # 绘制表格
                 rows = element.find_all('tr')
+                if not rows:
+                    continue
                 
-                # 计算列宽
-                col_count = max(len(row.find_all(['th', 'td'])) for row in rows)
-                col_widths = [img_width / col_count] * col_count
+                column_widths = table_column_widths[table_index] if table_index < len(table_column_widths) else []
+                table_index += 1
+                
+                if not column_widths:
+                    # 如果没有计算出列宽，使用均等宽度
+                    max_cols = max(len(row.find_all(['th', 'td'])) for row in rows)
+                    total_width = img_width - 2 * padding
+                    column_widths = [total_width / max_cols] * max_cols
                 
                 # 表格开始位置
                 table_top = y_position
                 table_left = padding
+                # 增加表格前的间距
+                y_position += 15
+                
+                # 计算表格总宽度
+                table_width = sum(column_widths)
                 
                 for row_idx, row in enumerate(rows):
                     cells = row.find_all(['th', 'td'])
-                    row_height = line_height * 1.5
+                    row_height = line_height * 1.8  # 增加行高
                     
                     # 绘制行背景
                     row_bg_color = table_header_bg if row_idx == 0 else background_color
                     draw.rectangle([(table_left, y_position), 
-                                    (img_width - padding, y_position + row_height)], 
+                                    (table_left + table_width, y_position + row_height)], 
                                   fill=row_bg_color)
                     
                     # 绘制单元格内容
                     x_pos = table_left
                     for col_idx, cell in enumerate(cells):
-                        if col_idx < len(col_widths):
-                            cell_width = col_widths[col_idx]
+                        if col_idx < len(column_widths):
+                            cell_width = column_widths[col_idx]
                             cell_text = cell.text.strip()
                             
                             # 调整单元格文本颜色 (可以根据内容设置不同颜色)
@@ -925,11 +971,17 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                             elif "看跌" in cell_text or "做空" in cell_text:
                                 cell_color = (200, 0, 0)  # 红色
                             
-                            # 绘制文本 (居中)
-                            text_width = draw.textlength(cell_text, font=regular_font)
-                            text_x = x_pos + (cell_width - text_width) / 2
-                            text_y = y_position + (row_height - line_height) / 2
-                            draw.text((text_x, text_y), cell_text, font=regular_font, fill=cell_color)
+                            # 文本换行处理
+                            wrapped_cell_text = textwrap.wrap(cell_text, width=int(cell_width/10))  # 根据单元格宽度换行
+                            text_y = y_position + 5  # 单元格内边距
+                            
+                            if wrapped_cell_text:
+                                for line in wrapped_cell_text:
+                                    # 计算文本位置（居中）
+                                    text_width = draw.textlength(line, font=regular_font)
+                                    text_x = x_pos + (cell_width - text_width) / 2
+                                    draw.text((text_x, text_y), line, font=regular_font, fill=cell_color)
+                                    text_y += line_height
                             
                             # 绘制单元格边框
                             draw.line([(x_pos, y_position), (x_pos, y_position + row_height)], 
@@ -938,22 +990,22 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                             x_pos += cell_width
                     
                     # 绘制右侧边框和底部边框
-                    draw.line([(img_width - padding, y_position), 
-                               (img_width - padding, y_position + row_height)], 
+                    draw.line([(table_left + table_width, y_position), 
+                               (table_left + table_width, y_position + row_height)], 
                              fill=table_border_color, width=1)
                     draw.line([(table_left, y_position + row_height), 
-                               (img_width - padding, y_position + row_height)], 
+                               (table_left + table_width, y_position + row_height)], 
                              fill=table_border_color, width=1)
                     
                     y_position += row_height
                 
-                y_position += 10  # 表格底部额外间距
+                y_position += 20  # 表格底部额外间距
             
             elif element.name in ('ul', 'ol'):
                 for idx, item in enumerate(element.find_all('li')):
                     bullet = '• ' if element.name == 'ul' else f"{idx+1}. "
                     item_text = bullet + item.text
-                    wrapped_lines = textwrap.wrap(item_text, width=65)  # 略窄以容纳缩进
+                    wrapped_lines = textwrap.wrap(item_text, width=90)  # 增加每行字符数
                     
                     for line_idx, line in enumerate(wrapped_lines):
                         # 第一行使用项目符号，后续行缩进对齐
@@ -965,7 +1017,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                             draw.text((padding + indent, y_position), line, font=regular_font, fill=text_color)
                         y_position += line_height
                 
-                y_position += 5  # 列表底部额外间距
+                y_position += 10  # 列表底部额外间距
             
             elif element.name == 'pre':
                 # 绘制代码块
@@ -973,23 +1025,23 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                 code_lines = code_text.split('\n')
                 
                 # 代码块背景
-                code_bg_height = len(code_lines) * line_height + 15
-                draw.rectangle([(padding - 5, y_position - 5), 
-                                (img_width - padding + 5, y_position + code_bg_height)], 
+                code_bg_height = len(code_lines) * line_height + 20
+                draw.rectangle([(padding - 10, y_position - 10), 
+                                (img_width - padding + 10, y_position + code_bg_height)], 
                               fill=(245, 245, 245))  # 浅灰色背景
                 
                 for code_line in code_lines:
                     draw.text((padding + 5, y_position + 5), code_line, font=small_font, fill=text_color)
                     y_position += line_height
                 
-                y_position += 15  # 代码块底部额外间距
+                y_position += 20  # 代码块底部额外间距
         
         # 添加水印和二维码
         # 对角线水印
-        watermark_font = regular_font
+        watermark_font = small_font
         watermark_text_width = draw.textlength(watermark, font=watermark_font)
         
-        for i in range(0, img_width + img_height, 300):
+        for i in range(0, img_width + img_height, 400):  # 减少水印密度
             x = max(0, i - img_height)
             y = max(0, img_height - i)
             draw.text((x + 50, y + 50), watermark, font=watermark_font, fill=watermark_color)
