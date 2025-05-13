@@ -37,8 +37,13 @@ SPOT_BASE_URL = "https://api.binance.com/api/v3"
 FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1"
 
 # DeepSeek API 配置
-DEEPSEEK_API_URL = "https://api.deepseek.ai/v1/chat/completions"  # 修正API URL
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"  # 修正API URL
 DEEPSEEK_API_KEY = config.get('API', 'DEEPSEEK_API_KEY')  # 从配置文件读取
+
+# 备选LLM API配置
+LLM_API_MODEL = config.get('API', 'LLM_API_MODEL', fallback='deepseek/deepseek-v3-0324')
+LLM_API_KEY = config.get('API', 'LLM_API_KEY', fallback='')
+LLM_API_BASE = config.get('API', 'LLM_API_BASE', fallback='https://api.ppinfra.com/v3/openai')
 
 # Binance 客户端初始化
 BINANCE_API_KEY = config.get('API', 'BINANCE_API_KEY')  # 从配置文件读取
@@ -504,7 +509,7 @@ def analyze_funding_pressure(klines_data: List[Dict], orderbook: Dict) -> Dict:
 
 
 def send_to_deepseek(data):
-    """将数据发送给DeepSeek API并获取解读"""
+    """将数据发送给DeepSeek API并获取解读，如果失败则使用备选API"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -564,7 +569,7 @@ def send_to_deepseek(data):
 
             "3. **短期趋势预判**：\n"
             "   - 基于资金流向和资金压力分析，预判未来4-8小时可能的价格走势\n"
-            "   - 识别可能的反转信号或趋势延续信号\n\n"
+            "   - 识别可能的反转信号或趋势延续信号\n"
             "   - 关注异常交易数据可能暗示的短期行情变化\n\n"
 
             "4. **交易策略建议**：\n"
@@ -578,21 +583,8 @@ def send_to_deepseek(data):
     )
 
     try:
-        # 首先测试连接
-        # logger.info("正在测试DeepSeek API连接...")
-        # test_payload = {
-        #     "model": "deepseek-chat",
-        #     "messages": [{"role": "user", "content": "Hello"}],
-        #     "max_tokens": 10
-        # }
-        
-        # test_response = requests.post(DEEPSEEK_API_URL, headers=headers, json=test_payload)
-        # if test_response.status_code != 200:
-        #     logger.error(f"DeepSeek API连接测试失败: HTTP {test_response.status_code}, {test_response.text}")
-        #     # 尝试使用modelscope或者Claude API替代
-        #     return generate_fallback_analysis(simplified_data)
-            
-        # logger.info("DeepSeek API连接测试成功，开始分析数据...")
+        # 尝试使用DeepSeek API
+        logger.info("使用DeepSeek API进行分析...")
         
         payload = {
             "model": "deepseek-chat",
@@ -611,11 +603,42 @@ def send_to_deepseek(data):
         if 'response' in locals():
             logger.error(f"响应状态码: {response.status_code}, 响应内容: {response.text}")
         
-        # 尝试使用备用方案
-        return generate_fallback_analysis(simplified_data)
+        # 尝试使用备选API
+        try:
+            if LLM_API_KEY:
+                logger.info(f"DeepSeek API失败，尝试使用备选API: {LLM_API_BASE}")
+                return use_backup_llm_api(prompt)
+            else:
+                logger.warning("备选API密钥未配置，使用本地分析逻辑")
+                return generate_fallback_analysis(simplified_data)
+        except Exception as backup_e:
+            logger.error(f"备选API调用失败: {backup_e}")
+            return generate_fallback_analysis(simplified_data)
+
+def use_backup_llm_api(prompt):
+    """使用备选的LLM API"""
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": LLM_API_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000,
+        "temperature": 0.7
+    }
+    
+    logger.info(f"使用备选API: {LLM_API_BASE}, 模型: {LLM_API_MODEL}")
+    response = requests.post(f"{LLM_API_BASE}/chat/completions", headers=headers, json=payload)
+    response.raise_for_status()
+    result = response.json()
+    
+    logger.info("备选API调用成功")
+    return result['choices'][0]['message']['content']
 
 def generate_fallback_analysis(data):
-    """当DeepSeek API失败时，生成基本分析结果"""
+    """当API调用全部失败时，生成基本分析结果"""
     logger.info("使用本地分析逻辑生成基本分析结果")
     
     analysis = "# Telegram @jin10light 区块链资金流向报告\n\n"
