@@ -10,7 +10,7 @@ import json
 import pickle
 from ratelimit import limits, sleep_and_retry
 from binance.client import Client
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import logging
 from scipy import stats
 import configparser
@@ -20,6 +20,7 @@ import io
 import textwrap
 import os
 import asyncio
+import re
 
 # 加载配置文件
 config = configparser.ConfigParser()
@@ -573,17 +574,156 @@ def load_cached_data(filename):
         return None
 
 
+def parse_markdown(text):
+    """解析Markdown文本，返回带格式指示的行列表"""
+    lines = text.split('\n')
+    parsed_lines = []
+    
+    in_code_block = False
+    in_table = False
+    table_data = []
+    
+    for line in lines:
+        # 处理代码块
+        if line.startswith('```') or line.endswith('```'):
+            in_code_block = not in_code_block
+            parsed_lines.append(('code_block_marker', line, {}))
+            continue
+            
+        if in_code_block:
+            parsed_lines.append(('code', line, {}))
+            continue
+            
+        # 检查是否是表格分隔符行
+        if re.match(r'^[\|\-\s]+$', line) and '|' in line:
+            if not in_table and parsed_lines and '|' in parsed_lines[-1][1]:
+                in_table = True
+                table_data = [parsed_lines.pop()[1]]  # 获取表头
+                table_data.append(line)  # 添加分隔符行
+            continue
+            
+        # 处理表格行
+        if in_table or ('|' in line and line.startswith('|') and line.endswith('|')):
+            if not in_table:
+                in_table = True
+                table_data = []
+            table_data.append(line)
+            continue
+            
+        # 表格结束
+        if in_table and ('|' not in line or not line.strip()):
+            if table_data:
+                parsed_lines.append(('table', table_data, {}))
+                table_data = []
+                in_table = False
+            if not line.strip():
+                parsed_lines.append(('text', '', {}))
+                continue
+                
+        # 处理标题
+        header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+        if header_match:
+            level = len(header_match.group(1))
+            title = header_match.group(2)
+            parsed_lines.append(('header', title, {'level': level}))
+            continue
+            
+        # 处理列表项
+        list_match = re.match(r'^(\s*)([\*\-\+]|\d+\.)\s+(.+)$', line)
+        if list_match:
+            indent = len(list_match.group(1))
+            list_type = 'bullet' if list_match.group(2) in ['*', '-', '+'] else 'numbered'
+            content = list_match.group(3)
+            parsed_lines.append(('list_item', content, {'type': list_type, 'indent': indent}))
+            continue
+            
+        # 处理引用
+        quote_match = re.match(r'^>\s+(.+)$', line)
+        if quote_match:
+            content = quote_match.group(1)
+            parsed_lines.append(('quote', content, {}))
+            continue
+            
+        # 处理水平线
+        if re.match(r'^[\-\*\_]{3,}$', line):
+            parsed_lines.append(('divider', '', {}))
+            continue
+            
+        # 处理普通文本，并应用内联格式
+        if line.strip():
+            # 处理内联格式(粗体、斜体、链接等)将在渲染时处理
+            parsed_lines.append(('text', line, {}))
+        else:
+            parsed_lines.append(('text', '', {}))
+    
+    # 处理剩余的表格
+    if in_table and table_data:
+        parsed_lines.append(('table', table_data, {}))
+        
+    return parsed_lines
+
+def get_inline_formats(text):
+    """处理文本中的内联格式，返回带格式信息的文本片段列表"""
+    segments = []
+    # 临时替换链接，以便处理其他格式
+    links = []
+    def replace_link(match):
+        links.append((match.group(1), match.group(2)))
+        return f"[[LINK{len(links)-1}]]"
+    
+    # 保存链接并替换为标记
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', replace_link, text)
+    
+    # 处理粗体
+    parts = re.split(r'(\*\*[^*]+\*\*)', text)
+    for part in parts:
+        if part.startswith('**') and part.endswith('**'):
+            segments.append(('bold', part[2:-2]))
+        else:
+            # 处理斜体
+            italic_parts = re.split(r'(\*[^*]+\*)', part)
+            for italic_part in italic_parts:
+                if italic_part.startswith('*') and italic_part.endswith('*'):
+                    segments.append(('italic', italic_part[1:-1]))
+                else:
+                    # 处理代码
+                    code_parts = re.split(r'(`[^`]+`)', italic_part)
+                    for code_part in code_parts:
+                        if code_part.startswith('`') and code_part.endswith('`'):
+                            segments.append(('inline_code', code_part[1:-1]))
+                        else:
+                            # 处理替换的链接
+                            if '[[LINK' in code_part:
+                                link_parts = re.split(r'(\[\[LINK\d+\]\])', code_part)
+                                for link_part in link_parts:
+                                    link_match = re.match(r'\[\[LINK(\d+)\]\]', link_part)
+                                    if link_match:
+                                        idx = int(link_match.group(1))
+                                        if idx < len(links):
+                                            text, url = links[idx]
+                                            segments.append(('link', text, {'url': url}))
+                                    elif link_part:
+                                        segments.append(('text', link_part))
+                            elif code_part:
+                                segments.append(('text', code_part))
+    
+    return segments
+
 def text_to_image(text, watermark="Telegram: @jin10light"):
-    """将文本转换为图片，并添加水印"""
+    """将Markdown文本转换为图片，并添加水印"""
     try:
+        # 解析Markdown
+        parsed_lines = parse_markdown(text)
+        
         # 设置字体和颜色
         background_color = (255, 255, 255)  # 白色背景
         text_color = (0, 0, 0)  # 黑色文字
         watermark_color = (180, 180, 180)  # 灰色水印
-        
-        # 准备文本内容
-        lines = text.split('\n')
-        max_line_length = max(len(line) for line in lines)
+        highlight_color = (230, 230, 230)  # 代码块背景色
+        quote_color = (100, 100, 100)  # 引用文字颜色
+        table_header_bg = (240, 240, 240)  # 表头背景色
+        table_border = (200, 200, 200)  # 表格边框颜色
+        link_color = (0, 0, 255)  # 链接颜色
         
         # 设置字体 (使用系统默认等宽字体)
         try:
@@ -591,18 +731,73 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
             font_path = "AlibabaPuHuiTi-3-55-Regular.ttf"
             font = ImageFont.truetype(font_path, 16)
             title_font = ImageFont.truetype(font_path, 24)
+            h2_font = ImageFont.truetype(font_path, 22)
+            h3_font = ImageFont.truetype(font_path, 20)
+            bold_font = ImageFont.truetype(font_path, 16)
+            code_font = ImageFont.truetype(font_path, 14)
             watermark_font = ImageFont.truetype(font_path, 20)
         except:
             # 如果找不到系统字体，使用默认字体
             font = ImageFont.load_default()
             title_font = ImageFont.load_default()
-            watermark_font = ImageFont.load_default()
+            h2_font = title_font
+            h3_font = title_font
+            bold_font = font
+            code_font = font
+            watermark_font = font
         
-        # 计算图片大小
-        line_height = 20
+        # 预估图片大小
+        line_height = {
+            'header': 36,  # 标题行高度
+            'h2': 32,
+            'h3': 28,
+            'text': 20,    # 文本行高度
+            'list_item': 20, # 列表项高度
+            'quote': 22,    # 引用高度
+            'divider': 20,  # 分隔线高度
+            'code': 18,     # 代码行高度
+            'table_row': 22, # 表格行高度
+            'blank': 10     # 空行高度
+        }
+        
+        # 计算基本宽度
+        max_line_length = max(len(line[1]) if isinstance(line[1], str) else 0 for line in parsed_lines)
+        max_table_width = 0
+        for line_type, content, _ in parsed_lines:
+            if line_type == 'table' and isinstance(content, list):
+                table_width = max(len(row) for row in content)
+                max_table_width = max(max_table_width, table_width)
+        
+        image_width = max(800, max(max_line_length * 10, max_table_width * 15))
+        
+        # 计算总高度
+        total_height = 0
+        for line_type, content, params in parsed_lines:
+            if line_type == 'header':
+                level = params.get('level', 1)
+                if level == 1:
+                    total_height += line_height['header']
+                elif level == 2:
+                    total_height += line_height['h2']
+                else:
+                    total_height += line_height['h3']
+            elif line_type == 'code_block_marker':
+                total_height += 5  # 代码块标记前后的间距
+            elif line_type == 'code':
+                total_height += line_height['code']
+            elif line_type == 'divider':
+                total_height += line_height['divider']
+            elif line_type == 'table':
+                if isinstance(content, list):
+                    total_height += len(content) * line_height['table_row'] + 10  # 表格行 + 边距
+            elif line_type == 'text' and not content:
+                total_height += line_height['blank']
+            else:
+                total_height += line_height[line_type] if line_type in line_height else line_height['text']
+                
+        # 添加边距
         padding = 20
-        image_width = max(800, max_line_length * 10)  # 确保至少800像素宽
-        image_height = (len(lines) + 5) * line_height + 2 * padding
+        image_height = total_height + 2 * padding
         
         # 创建图片
         image = Image.new('RGB', (image_width, image_height), background_color)
@@ -610,14 +805,162 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         
         # 绘制文本
         y_position = padding
-        for i, line in enumerate(lines):
-            # 第一行作为标题使用大号字体
-            if i == 0 and line.startswith('#'):
-                draw.text((padding, y_position), line, font=title_font, fill=text_color)
-                y_position += line_height * 1.5
-            else:
-                draw.text((padding, y_position), line, font=font, fill=text_color)
-                y_position += line_height
+        in_code_block = False
+        code_block_start_y = 0
+        
+        for line_type, content, params in parsed_lines:
+            if line_type == 'code_block_marker':
+                if in_code_block:
+                    # 结束代码块，绘制背景
+                    code_block_height = y_position - code_block_start_y
+                    draw.rectangle((padding - 5, code_block_start_y - 5, 
+                                    image_width - padding + 5, y_position + 5), 
+                                  fill=highlight_color)
+                    y_position += 10  # 代码块结束后额外空间
+                else:
+                    # 开始代码块
+                    code_block_start_y = y_position
+                in_code_block = not in_code_block
+                continue
+                
+            if line_type == 'header':
+                level = params.get('level', 1)
+                if level == 1:
+                    draw.text((padding, y_position), content, font=title_font, fill=text_color)
+                    y_position += line_height['header']
+                elif level == 2:
+                    draw.text((padding, y_position), content, font=h2_font, fill=text_color)
+                    y_position += line_height['h2']
+                else:
+                    draw.text((padding, y_position), content, font=h3_font, fill=text_color)
+                    y_position += line_height['h3']
+                    
+            elif line_type == 'text':
+                if not content:
+                    y_position += line_height['blank']
+                    continue
+                    
+                # 处理内联格式
+                segments = get_inline_formats(content)
+                x_pos = padding
+                
+                for segment in segments:
+                    if isinstance(segment, tuple):
+                        if segment[0] == 'text':
+                            seg_width = draw.textlength(segment[1], font=font)
+                            draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
+                            x_pos += seg_width
+                        elif segment[0] == 'bold':
+                            seg_width = draw.textlength(segment[1], font=bold_font)
+                            draw.text((x_pos, y_position), segment[1], font=bold_font, fill=text_color)
+                            x_pos += seg_width
+                        elif segment[0] == 'italic':
+                            seg_width = draw.textlength(segment[1], font=font)
+                            # 模拟斜体效果
+                            draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
+                            x_pos += seg_width
+                        elif segment[0] == 'inline_code':
+                            # 绘制内联代码背景
+                            seg_width = draw.textlength(segment[1], font=code_font)
+                            draw.rectangle((x_pos - 2, y_position - 2, 
+                                           x_pos + seg_width + 2, y_position + line_height['text'] - 2), 
+                                          fill=highlight_color)
+                            draw.text((x_pos, y_position), segment[1], font=code_font, fill=text_color)
+                            x_pos += seg_width + 4
+                        elif segment[0] == 'link':
+                            seg_width = draw.textlength(segment[1], font=font)
+                            draw.text((x_pos, y_position), segment[1], font=font, fill=link_color)
+                            x_pos += seg_width
+                            
+                y_position += line_height['text']
+                    
+            elif line_type == 'list_item':
+                indent = params.get('indent', 0)
+                list_type = params.get('type', 'bullet')
+                x_indent = padding + indent + 20
+                
+                # 绘制列表项标记
+                if list_type == 'bullet':
+                    # 绘制圆点
+                    bullet_radius = 3
+                    bullet_y = y_position + line_height['list_item'] // 2
+                    draw.ellipse((padding + indent + 5 - bullet_radius, bullet_y - bullet_radius, 
+                                padding + indent + 5 + bullet_radius, bullet_y + bullet_radius), 
+                               fill=text_color)
+                
+                # 绘制列表项文本
+                draw.text((x_indent, y_position), content, font=font, fill=text_color)
+                y_position += line_height['list_item']
+                    
+            elif line_type == 'quote':
+                # 绘制引用竖线
+                draw.rectangle((padding, y_position, padding + 3, y_position + line_height['quote']),
+                             fill=quote_color)
+                # 绘制引用文本
+                draw.text((padding + 10, y_position), content, font=font, fill=quote_color)
+                y_position += line_height['quote']
+                    
+            elif line_type == 'divider':
+                # 绘制分隔线
+                line_y = y_position + line_height['divider'] // 2
+                draw.line((padding, line_y, image_width - padding, line_y), fill=text_color, width=1)
+                y_position += line_height['divider']
+                    
+            elif line_type == 'code':
+                # 绘制代码行
+                draw.text((padding, y_position), content, font=code_font, fill=text_color)
+                y_position += line_height['code']
+                    
+            elif line_type == 'table' and isinstance(content, list):
+                if len(content) > 1:
+                    # 处理表格
+                    rows = []
+                    for row in content:
+                        if '|' in row:
+                            cells = [cell.strip() for cell in row.split('|')]
+                            # 移除空单元格（表格行首尾的|会产生空单元格）
+                            if not cells[0]:
+                                cells = cells[1:]
+                            if not cells[-1]:
+                                cells = cells[:-1]
+                            rows.append(cells)
+                    
+                    if rows:
+                        col_count = max(len(row) for row in rows)
+                        col_width = (image_width - 2 * padding) // col_count
+                        
+                        # 绘制表格
+                        for i, row in enumerate(rows):
+                            row_y = y_position
+                            # 表头背景
+                            if i == 0:
+                                draw.rectangle((padding, row_y, 
+                                               image_width - padding, row_y + line_height['table_row']),
+                                             fill=table_header_bg)
+                            
+                            # 绘制单元格内容
+                            for j, cell in enumerate(row):
+                                if j < col_count:  # 确保不超出列数
+                                    cell_x = padding + j * col_width
+                                    draw.text((cell_x + 5, row_y + 2), cell, font=font, fill=text_color)
+                            
+                            # 绘制表格横线
+                            draw.line((padding, row_y, image_width - padding, row_y), 
+                                     fill=table_border, width=1)
+                            
+                            y_position += line_height['table_row']
+                        
+                        # 最后一行的底线
+                        draw.line((padding, y_position, image_width - padding, y_position), 
+                                 fill=table_border, width=1)
+                        
+                        # 绘制表格竖线
+                        for j in range(col_count + 1):
+                            col_x = padding + j * col_width
+                            draw.line((col_x, y_position - len(rows) * line_height['table_row'], 
+                                     col_x, y_position), fill=table_border, width=1)
+                            
+                        y_position += 10  # 表格后添加一些空间
         
         # 添加半透明水印（在图片四个角和中心）
         watermark_positions = [
