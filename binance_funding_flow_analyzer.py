@@ -744,6 +744,89 @@ def _parse_table_content(table_md_lines: List[str]) -> List[List[str]]:
     return parsed_rows
 
 
+def wrap_text_by_pixel_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    max_pixel_width: int
+) -> List[str]:
+    if not text: # Handles None or empty string early
+        return ['']
+    if max_pixel_width <= 0:
+        return [text] # No sensible wrapping possible
+
+    output_lines = []
+    source_lines = text.split('\\n')
+
+    for source_line_idx, source_line_content in enumerate(source_lines):
+        if not source_line_content.strip():
+            output_lines.append('')
+            continue
+
+        current_accumulated_line_parts = []
+        current_accumulated_width = 0
+        
+        # Tokenize the line into words and spaces/delimiters
+        tokens = []
+        current_token = ""
+        for char in source_line_content:
+            if char.isspace():
+                if current_token: tokens.append(current_token)
+                tokens.append(char) # Keep space as a token
+                current_token = ""
+            else: # Non-space character
+                current_token += char
+        if current_token: tokens.append(current_token)
+
+        if not tokens:
+            output_lines.append('')
+            continue
+
+        for token_idx, token in enumerate(tokens):
+            token_width = draw.textlength(token, font=font)
+
+            if current_accumulated_line_parts and current_accumulated_width + token_width > max_pixel_width:
+                # Current token makes the line too long, finalize previous line
+                output_lines.append("".join(current_accumulated_line_parts))
+                current_accumulated_line_parts = []
+                current_accumulated_width = 0
+                
+                # If the overflowing token is a space, we can often discard it at the start of a new line
+                if token.isspace():
+                    continue # Skip this space token as it would start the new line
+            
+            # If a single token (word) is wider than max_pixel_width, hard break it
+            if token_width > max_pixel_width and not token.isspace():
+                # Add any preceding part of the line before breaking this long token
+                if current_accumulated_line_parts:
+                    output_lines.append("".join(current_accumulated_line_parts))
+                    current_accumulated_line_parts = []
+                    current_accumulated_width = 0
+
+                # Hard break the long token
+                sub_token_part = ""
+                for char_in_token_idx, char_in_token in enumerate(token):
+                    char_width = draw.textlength(char_in_token, font=font)
+                    if draw.textlength(sub_token_part + char_in_token, font=font) > max_pixel_width and sub_token_part:
+                        output_lines.append(sub_token_part)
+                        sub_token_part = char_in_token
+                    else:
+                        sub_token_part += char_in_token
+                if sub_token_part: # Add the remainder of the hard-broken token
+                    current_accumulated_line_parts.append(sub_token_part)
+                    current_accumulated_width = draw.textlength(sub_token_part, font=font)
+            else:
+                # Token fits or is a space that fits
+                current_accumulated_line_parts.append(token)
+                current_accumulated_width += token_width
+        
+        # Add any remaining part of the line
+        if current_accumulated_line_parts:
+            output_lines.append("".join(current_accumulated_line_parts))
+
+    return output_lines if output_lines else ['']
+
+
 def _calculate_wrapped_dimensions(
     parsed_markdown_lines: List[Tuple[str, any, Dict]],
     fonts: Dict[str, ImageFont.FreeTypeFont],
@@ -754,17 +837,9 @@ def _calculate_wrapped_dimensions(
     line_spacing_config: int,
     cell_padding_config: int
 ):
-    """
-    Calculates content dimensions after text wrapping and prepares wrapped data.
-    Returns a dict: {"content_width": int, "content_height": int, "processed_lines": list}
-    Each item in processed_lines: (type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_lines_data)
-    wrapped_sub_lines_data for text-like: list of strings (the wrapped lines)
-    wrapped_sub_lines_data for table: (list of list of wrapped_cell_lines, final_col_widths)
-    """
-    content_max_x = 0  # Max width reached by any single element
+    content_max_x = 0
     current_y_offset = 0
     processed_lines_output = []
-
     available_render_width = base_image_width - 2 * padding_config
 
     for line_idx, (line_type, original_content, params) in enumerate(parsed_markdown_lines):
@@ -779,73 +854,54 @@ def _calculate_wrapped_dimensions(
         if line_type == 'header':
             level = params.get('level', 1)
             current_font = fonts['title'] if level == 1 else fonts['h2'] if level == 2 else fonts['h3']
+            # Headers are typically not wrapped, their width is their textlength
             item_width = temp_draw.textlength(original_content, font=current_font)
-            item_height = (line_heights_config.get(f'h{level}', line_heights_config['header']) + 
-                           (line_spacing_config if level == 1 else line_spacing_config // 2)) # More space after H1
-            if level == 1: # Extra space for H1 separator line
-                item_height += 7 # 5 for line + 2 for spacing
+            line_h_key = f'h{level}' if f'h{level}' in line_heights_config else 'header'
+            item_height = line_heights_config[line_h_key] + (line_spacing_config if level == 1 else line_spacing_config // 2)
+            if level == 1: item_height += 7 
             wrapped_sub_lines_data = [original_content]
+
         elif line_type in ['text', 'list_item', 'quote']:
             indent = params.get('indent', 0)
             prefix_width = 0
-            if line_type == 'list_item':
-                prefix_width = 20 # For bullet/number
+            if line_type == 'list_item': prefix_width = 20 
             
-            text_render_width = available_render_width - (indent + prefix_width)
+            text_render_max_width = available_render_width - (indent + prefix_width)
             
-            # Estimate characters per line
-            avg_char_width = temp_draw.textlength("x", font=font_regular)
-            if avg_char_width == 0: avg_char_width = 8 # Fallback
-            chars_to_wrap = max(10, int(text_render_width / avg_char_width))
-
-            wrapped_lines = []
-            if original_content and isinstance(original_content, str):
-                 wrapped_lines = textwrap.wrap(original_content, width=chars_to_wrap, replace_whitespace=False, drop_whitespace=True)
-            if not wrapped_lines and original_content: # If wrap results in empty but original was not
-                wrapped_lines = [' '] 
-            elif not wrapped_lines and not original_content: # Truly empty line
-                 wrapped_lines = ['']
-
+            current_font_for_wrap = font_regular # Default, inline formats handled at draw time
+            wrapped_lines = wrap_text_by_pixel_width(temp_draw, original_content, current_font_for_wrap, text_render_max_width)
 
             current_item_max_w = 0
             for sub_line in wrapped_lines:
-                # Width calculation for mixed inline formats is complex.
-                # For now, estimate based on regular font for simplicity in dimension calculation.
-                # Actual drawing will handle inline formats.
-                sub_line_width = temp_draw.textlength(sub_line, font=font_regular)
+                sub_line_width = temp_draw.textlength(sub_line, font=current_font_for_wrap)
                 current_item_max_w = max(current_item_max_w, sub_line_width)
             
             item_width = current_item_max_w + indent + prefix_width
-            item_height = (len(wrapped_lines) * line_heights_config[line_type] + 
-                           (len(wrapped_lines) -1 ) * (line_spacing_config // 2) + # Intra-item line spacing
-                           line_spacing_config) # Space after item
+            num_lines = len(wrapped_lines)
+            item_height = (num_lines * line_heights_config[line_type] +
+                           max(0, (num_lines - 1)) * (line_spacing_config // 2) +
+                           line_spacing_config)
             wrapped_sub_lines_data = wrapped_lines
             
-            if line_type == 'text' and not original_content.strip(): # Blank line
-                item_height = line_heights_config['blank'] # No extra line_spacing_config
+            if line_type == 'text' and not original_content.strip():
+                item_height = line_heights_config['blank']
 
         elif line_type == 'code_block_marker':
-            item_height = 5 + line_spacing_config # Small space for marker rendering logic
-            # Actual code block background is drawn based on code lines between markers
+            item_height = 5 + line_spacing_config 
         
-        elif line_type == 'code': # A single line within a code block
-            # Code lines are typically not wrapped aggressively, but could be if very long
-            text_render_width = available_render_width
-            avg_char_width_code = temp_draw.textlength("x", font=font_code)
-            if avg_char_width_code == 0: avg_char_width_code = 7
-            chars_to_wrap_code = max(20, int(text_render_width / avg_char_width_code))
+        elif line_type == 'code': 
+            text_render_max_width = available_render_width # Code blocks use full width minus padding
+            wrapped_code_lines = wrap_text_by_pixel_width(temp_draw, original_content, font_code, text_render_max_width)
             
-            wrapped_code_lines = textwrap.wrap(original_content, width=chars_to_wrap_code)
-            if not wrapped_code_lines: wrapped_code_lines = [' ']
-
             current_item_max_w = 0
             for sub_line in wrapped_code_lines:
                  current_item_max_w = max(current_item_max_w, temp_draw.textlength(sub_line, font=font_code))
             
             item_width = current_item_max_w
-            item_height = (len(wrapped_code_lines) * line_heights_config['code'] +
-                           (len(wrapped_code_lines) -1) * (line_spacing_config // 2) + # Intra-item line spacing
-                           line_spacing_config // 2) # Smaller spacing after each code line before block ends
+            num_lines = len(wrapped_code_lines)
+            item_height = (num_lines * line_heights_config['code'] +
+                           max(0, (num_lines - 1)) * (line_spacing_config // 2) +
+                           line_spacing_config // 2) 
             wrapped_sub_lines_data = wrapped_code_lines
 
         elif line_type == 'divider':
@@ -861,74 +917,113 @@ def _calculate_wrapped_dimensions(
             wrapped_table_cells_data = [[[] for _ in range(num_cols)] for _ in range(num_rows)]
 
             if num_cols > 0:
-                # Pass 1: Determine natural width of each cell
-                col_natural_widths = [0] * num_cols
+                # --- Table Column Width Calculation ---
+                # 1. Calculate preferred and minimum widths for each cell
+                cell_pref_widths = [[0] * num_cols for _ in range(num_rows)]
+                cell_min_widths = [[0] * num_cols for _ in range(num_rows)]
+                
+                MIN_CHARS_FOR_MIN_WIDTH = 8 # Estimate min width based on ~8 chars
+                
                 for r_idx, row_data in enumerate(raw_rows_content):
                     for c_idx, cell_text in enumerate(row_data):
                         if c_idx < num_cols:
                             font_to_use = font_bold if r_idx == 0 else font_regular
-                            cell_w = temp_draw.textlength(cell_text, font=font_to_use) + 2 * cell_padding_config
-                            col_natural_widths[c_idx] = max(col_natural_widths[c_idx], cell_w)
+                            cell_pref_widths[r_idx][c_idx] = temp_draw.textlength(cell_text, font=font_to_use) + 2 * cell_padding_config
+                            
+                            # Min width: try to fit at least MIN_CHARS_FOR_MIN_WIDTH or longest word
+                            min_w_text_part = cell_text[:MIN_CHARS_FOR_MIN_WIDTH]
+                            if len(cell_text) > MIN_CHARS_FOR_MIN_WIDTH and ' ' in cell_text: # Check longest word
+                                longest_word = max(cell_text.split(' '), key=len)
+                                min_w_text_part = longest_word if len(longest_word) > MIN_CHARS_FOR_MIN_WIDTH else min_w_text_part
+
+                            min_width_val = temp_draw.textlength(min_w_text_part, font=font_to_use) + 2 * cell_padding_config
+                            cell_min_widths[r_idx][c_idx] = max(50, min_width_val) # Absolute min of 50px
+
+
+                col_max_pref_widths = [0] * num_cols
+                col_abs_min_widths = [50] * num_cols # Fallback absolute minimum for a column
+                for c in range(num_cols):
+                    max_pref = 0
+                    max_min_for_col = 0
+                    for r in range(num_rows):
+                        max_pref = max(max_pref, cell_pref_widths[r][c])
+                        max_min_for_col = max(max_min_for_col, cell_min_widths[r][c])
+                    col_max_pref_widths[c] = max_pref
+                    col_abs_min_widths[c] = max(col_abs_min_widths[c],max_min_for_col)
+
+
+                total_pref_width = sum(col_max_pref_widths)
                 
-                total_natural_table_width = sum(col_natural_widths)
-                
-                # Pass 2: Allocate available_render_width to columns
-                if total_natural_table_width <= available_render_width:
-                    final_col_widths = col_natural_widths
+                if total_pref_width <= available_render_width:
+                    final_col_widths = col_max_pref_widths
                 else:
-                    # Proportional scaling for columns that need to shrink
-                    # Ensure minimum width for each column (e.g., 50px)
-                    min_col_width = 50 
-                    excess_width = available_render_width - sum(min_col_width for _ in range(num_cols) if col_natural_widths[_] > min_col_width)
-                    
-                    scalable_natural_width = sum(w for w in col_natural_widths if w > min_col_width)
-                    
-                    for c_idx in range(num_cols):
-                        if col_natural_widths[c_idx] <= min_col_width:
-                            final_col_widths[c_idx] = col_natural_widths[c_idx]
-                        elif scalable_natural_width > 0 : # and excess_width > 0:
-                             final_col_widths[c_idx] = max(min_col_width, (col_natural_widths[c_idx] / scalable_natural_width) * excess_width if excess_width > 0 else min_col_width)
-                        else: # All columns are huge, divide equally
-                            final_col_widths[c_idx] = max(min_col_width, available_render_width / num_cols)
+                    # Distribute width: first satisfy min_widths, then distribute rest proportionally
+                    total_min_width = sum(col_abs_min_widths)
+                    if total_min_width >= available_render_width: # Not enough space even for all mins
+                        # Scale down min_widths proportionally if they overflow (highly constrained case)
+                        if total_min_width > 0 :
+                             scale_factor = available_render_width / total_min_width
+                             final_col_widths = [max(30, int(w * scale_factor)) for w in col_abs_min_widths] # Hard min 30
+                        else: # Should not happen if num_cols > 0
+                             final_col_widths = [available_render_width / num_cols] * num_cols
+
+                    else:
+                        current_widths = list(col_abs_min_widths)
+                        remaining_width = available_render_width - sum(current_widths)
+                        
+                        # Calculate how much each col *wants* to expand beyond its min
+                        expand_potential = [col_max_pref_widths[c] - col_abs_min_widths[c] for c in range(num_cols)]
+                        total_expand_potential = sum(p for p in expand_potential if p > 0)
+
+                        if total_expand_potential > 0:
+                            for c in range(num_cols):
+                                if expand_potential[c] > 0:
+                                    share = (expand_potential[c] / total_expand_potential) * remaining_width
+                                    current_widths[c] += share
+                        final_col_widths = [int(w) for w in current_widths]
                 
-                # Ensure sum of final_col_widths does not exceed available_render_width significantly (due to min_col_width constraints)
-                # This simple normalization might be needed if the above logic makes it too wide.
+                # Final check to ensure total doesn't exceed available_render_width due to rounding/min_width logic
                 current_total_final_width = sum(final_col_widths)
                 if current_total_final_width > available_render_width and current_total_final_width > 0:
                     scale_factor = available_render_width / current_total_final_width
-                    final_col_widths = [max(int(w * scale_factor), 30) for w in final_col_widths] # Min 30px hard fallback
+                    final_col_widths = [max(int(w * scale_factor), 30) for w in final_col_widths]
 
 
-                # Pass 3: Wrap cell content based on final_col_widths and calculate row heights
+                # --- Wrap cell content based on final_col_widths and calculate row heights ---
                 table_render_height = 0
                 for r_idx, row_data in enumerate(raw_rows_content):
-                    max_wrapped_lines_in_this_row = 1
+                    max_wrapped_lines_in_this_row = 0 # Min 1 line per row visually
                     for c_idx, cell_text in enumerate(row_data):
                         if c_idx < num_cols:
-                            cell_render_width = final_col_widths[c_idx] - 2 * cell_padding_config
+                            cell_render_max_width = final_col_widths[c_idx] - 2 * cell_padding_config
                             font_to_use = font_bold if r_idx == 0 else font_regular
-                            avg_char_w_cell = temp_draw.textlength("x", font=font_to_use)
-                            if avg_char_w_cell == 0: avg_char_w_cell = 8
                             
-                            chars_to_wrap_cell = max(1, int(cell_render_width / avg_char_w_cell))
-                            wrapped_cell = textwrap.wrap(cell_text, width=chars_to_wrap_cell)
-                            if not wrapped_cell: wrapped_cell = [' '] # Ensure at least one line for height
-                            
-                            wrapped_table_cells_data[r_idx][c_idx] = wrapped_cell
-                            max_wrapped_lines_in_this_row = max(max_wrapped_lines_in_this_row, len(wrapped_cell))
-                    
-                    table_render_height += max_wrapped_lines_in_this_row * line_heights_config['table_row']
-                    if r_idx < num_rows -1:
-                         table_render_height += line_spacing_config // 2 # spacing between table rows
+                            wrapped_cell_lines = wrap_text_by_pixel_width(temp_draw, cell_text, font_to_use, cell_render_max_width)
+                            if not wrapped_cell_lines and cell_text.strip(): # if text exists but wrap is empty, means it's likely just spaces
+                                wrapped_cell_lines = [' ']
+                            elif not wrapped_cell_lines: # truly empty cell
+                                wrapped_cell_lines = [' ']
 
-                item_width = sum(final_col_widths)
-                item_height = table_render_height + line_spacing_config # Space after table
-                wrapped_sub_lines_data = (wrapped_table_cells_data, final_col_widths, raw_rows_content) # Store raw too for drawing
-            else: # No columns
+
+                            wrapped_table_cells_data[r_idx][c_idx] = wrapped_cell_lines
+                            max_wrapped_lines_in_this_row = max(max_wrapped_lines_in_this_row, len(wrapped_cell_lines))
+                    
+                    if max_wrapped_lines_in_this_row == 0: max_wrapped_lines_in_this_row = 1 # Visual row must take at least 1 line height
+                    
+                    table_render_height += (max_wrapped_lines_in_this_row * line_heights_config['table_row'] +
+                                            max(0, max_wrapped_lines_in_this_row -1) * (line_spacing_config // 3) # tighter spacing within cell multi-lines
+                                           )
+                    if r_idx < num_rows - 1:
+                         table_render_height += line_spacing_config // 2 
+
+                item_width = sum(final_col_widths) 
+                item_height = table_render_height + line_spacing_config 
+                wrapped_sub_lines_data = (wrapped_table_cells_data, final_col_widths, raw_rows_content)
+            else: 
                 item_width = 0
                 item_height = line_spacing_config
 
-        else: # Unknown type or blank line from parse_markdown
+        else: 
             item_height = line_heights_config['blank']
 
         content_max_x = max(content_max_x, item_width)
@@ -1015,8 +1110,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
             fonts = {k: default_font_instance for k in ['regular', 'bold', 'title', 'h2', 'h3', 'code', 'watermark']}
 
         # --- Dimension Calculation ---
-        # Create a temporary draw object for textlength calls
-        temp_img_for_calc = Image.new('RGB', (1,1), background_color)
+        temp_img_for_calc = Image.new('RGB', (1,1), background_color) # Small, just for draw object
         temp_draw_obj = ImageDraw.Draw(temp_img_for_calc)
 
         # First pass for width estimation
@@ -1278,376 +1372,1932 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                      for sub_code_line in code_l_wrapped:
                         draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
                         temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
 
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
 
-        # --- Footer ---
-        actual_content_end_y = y_position # This should be the end of all drawn content
-        footer_start_y = max(actual_content_end_y + line_spacing, image_height - footer_height + padding)
-
-
-        draw.line((padding, footer_start_y, image_width - padding, footer_start_y), 
-                  fill=table_border_color, width=1)
-        footer_text_y = footer_start_y + 10
-
-        # Date and disclaimer
-        current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC') # Use UTC or specify timezone
-        footnote_text = f"注: 所有时间均为UTC时间，价格单位为USDT。数据截止 {current_time_str}，实际交易需结合实时数据验证。"
-        
-        # Wrap footnote
-        avg_char_w_footer = draw.textlength("x", font=fonts['regular'])
-        if avg_char_w_footer == 0: avg_char_w_footer = 8
-        footer_wrap_chars = max(10, int((image_width - 2 * padding) / avg_char_w_footer))
-        wrapped_footnote = textwrap.wrap(footnote_text, width=footer_wrap_chars)
-
-        for line in wrapped_footnote:
-            draw.text((padding, footer_text_y), line, font=fonts['regular'], fill=(100,100,100))
-            footer_text_y += line_heights['text'] # Use text line height
-
-        footer_text_y += (line_spacing // 2)
-        disclaimer_text = "*免责声明: 本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险。"
-        wrapped_disclaimer = textwrap.wrap(disclaimer_text, width=footer_wrap_chars)
-        for line in wrapped_disclaimer:
-            draw.text((padding, footer_text_y), line, font=fonts['regular'], fill=(100,100,100))
-            footer_text_y += line_heights['text']
-        
-        # QR Code and Telegram Info (Right side of footer)
-        qr_available_width = image_width // 3 # Allocate space for QR + text
-        qr_text_x_start = image_width - padding - qr_available_width
-        qr_y_start = footer_start_y + 10
-
-        try:
-            import qrcode
-            qr_data = "https://t.me/jin10light" # Example URL
-            qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=8, border=2)
-            qr.add_data(qr_data)
-            qr.make(fit=True)
-            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA") # Ensure RGBA for transparency if needed
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
             
-            qr_max_size = footer_height - 40 # Max size for QR
-            qr_img = qr_img.resize((min(qr_max_size, 100), min(qr_max_size, 100)), Image.Resampling.LANCZOS) # Keep it reasonable
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
             
-            qr_actual_size = qr_img.width
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
             
-            qr_paste_x = image_width - padding - qr_actual_size
-            qr_paste_y = qr_y_start
-            image.paste(qr_img, (qr_paste_x, qr_paste_y), qr_img if qr_img.mode == 'RGBA' else None)
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
 
-            tg_text = "Telegram: @jin10light"
-            tg_text_w = draw.textlength(tg_text, font=fonts['regular'])
-            tg_text_x = qr_paste_x - tg_text_w - 10 # To the left of QR
-            tg_text_y = qr_paste_y + qr_actual_size // 2 - (line_heights['text'] //2) 
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
             
-            if tg_text_x < padding: # If text would overflow left, place below QR
-                 tg_text_x = qr_paste_x
-                 tg_text_y = qr_paste_y + qr_actual_size + 5
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
 
-            draw.text((tg_text_x, tg_text_y), tg_text, font=fonts['regular'], fill=text_color)
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
 
-        except ImportError:
-            logger.warning("qrcode library not installed. Skipping QR code.")
-            tg_text_fallback = "Telegram: @jin10light (QR disabled)"
-            draw.text((qr_text_x_start, qr_y_start + 20), tg_text_fallback, font=fonts['regular'], fill=text_color)
-        except Exception as e:
-            logger.error(f"Failed to generate or place QR code: {e}", exc_info=True)
-            tg_text_fallback = "Telegram: @jin10light (QR error)"
-            draw.text((qr_text_x_start, qr_y_start + 20), tg_text_fallback, font=fonts['regular'], fill=text_color)
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
 
 
-        # --- Save to Buffer ---
-        buffer = io.BytesIO()
-        image.save(buffer, format='PNG')
-        buffer.seek(0)
-        return buffer
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
 
-    except Exception as e:
-        logger.error(f"Text to image conversion failed: {e}", exc_info=True)
-        # Create a simple error image
-        try:
-            err_img = Image.new('RGB', (600, 100), (255,200,200))
-            err_draw = ImageDraw.Draw(err_img)
-            err_font = ImageFont.load_default()
-            err_draw.text((10,10), "Error generating image.", font=err_font, fill=(0,0,0))
-            err_draw.text((10,30), str(e)[:80], font=err_font, fill=(0,0,0))
-            err_buffer = io.BytesIO()
-            err_img.save(err_buffer, format='PNG')
-            err_buffer.seek(0)
-            return err_buffer
-        except: # Ultimate fallback
-             return None
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
 
 
-async def send_telegram_message_async(message, as_image=True):
-    """异步发送Telegram消息"""
-    try:
-        bot_token = config.get('TELEGRAM', 'BOT_TOKEN')
-        chat_id = config.get('TELEGRAM', 'CHAT_ID')
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        # 在消息最后加上免责声明
-        if not message.endswith("*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"):
-            message += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        bot = Bot(token=bot_token)
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        if as_image:
-            # 将消息转换为图片
-            image_buffer = text_to_image(message)
-            if image_buffer:
-                # 异步发送图片
-                await bot.send_photo(chat_id=chat_id, photo=image_buffer)
-                logger.info("成功发送Telegram图片消息")
-                return True
-            else:
-                logger.error("图片生成失败，尝试发送文本消息")
-                # 如果图片生成失败，回退到发送文本消息
-                await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
-                logger.info("成功发送Telegram文本消息")
-                return True
-        else:
-            # 直接发送文本消息
-            await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
-            logger.info("成功发送Telegram文本消息")
-            return True
-    except Exception as e:
-        logger.error(f"发送Telegram消息时出错: {e}")
-        return False
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
 
-def send_telegram_message(message, as_image=True):
-    """发送Telegram消息的同步包装函数"""
-    try:
-        # 创建新的事件循环
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        # 运行异步函数
-        result = loop.run_until_complete(send_telegram_message_async(message, as_image))
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        # 关闭事件循环
-        loop.close()
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        return result
-    except Exception as e:
-        logger.error(f"执行Telegram异步消息发送时出错: {e}")
-        return False
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
 
 
-def main_optimized():
-    logger.info(f"开始运行，当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"目标交易对: {SYMBOLS}")
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
 
-    # 获取现货和期货的5分钟K线数据
-    spot_klines_data = {}
-    futures_klines_data = {}
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
 
-    for symbol in SYMBOLS:
-        logger.info(f"获取 {symbol} 现货5分钟K线数据...")
-        spot_klines_data[symbol] = get_klines_data(symbol, interval='5m', limit=50, is_futures=False)
-
-        logger.info(f"获取 {symbol} 期货5分钟K线数据...")
-        futures_klines_data[symbol] = get_klines_data(symbol, interval='5m', limit=50, is_futures=True)
-
-    # 获取订单簿数据
-    logger.info("获取订单簿数据...")
-    spot_order_books = {}
-    futures_order_books = {}
-
-    for symbol in SYMBOLS:
-        spot_order_books[symbol] = get_orderbook_stats(symbol, is_futures=False)
-        futures_order_books[symbol] = get_orderbook_stats(symbol, is_futures=True)
-
-    # 分析资金流向趋势
-    logger.info("分析资金流向趋势...")
-    spot_trend_analysis = {}
-    futures_trend_analysis = {}
-
-    for symbol in SYMBOLS:
-        spot_trend_analysis[symbol] = analyze_funding_flow_trend(spot_klines_data[symbol])
-        futures_trend_analysis[symbol] = analyze_funding_flow_trend(futures_klines_data[symbol])
-
-    # 检测异常交易
-    logger.info("检测异常交易...")
-    spot_anomalies = {}
-    futures_anomalies = {}
-
-    for symbol in SYMBOLS:
-        spot_anomalies[symbol] = detect_anomalies(spot_klines_data[symbol])
-        futures_anomalies[symbol] = detect_anomalies(futures_klines_data[symbol])
-
-    # 分析资金压力
-    logger.info("分析资金压力...")
-    spot_funding_pressure = {}
-    futures_funding_pressure = {}
-
-    for symbol in SYMBOLS:
-        if symbol in spot_order_books and spot_order_books[symbol]:
-            spot_funding_pressure[symbol] = analyze_funding_pressure(spot_klines_data[symbol], spot_order_books[symbol])
-
-        if symbol in futures_order_books and futures_order_books[symbol]:
-            futures_funding_pressure[symbol] = analyze_funding_pressure(futures_klines_data[symbol],
-                                                                        futures_order_books[symbol])
-
-    # 准备DeepSeek数据
-    deepseek_data = {
-        "spot_klines_summary": {
-            symbol: {
-                "count": len(data),
-                "time_range": f"{data[0]['open_time']} to {data[-1]['close_time']}" if data else "No data",
-                "latest_price": data[-1]['close'] if data else None,
-                "price_change_pct": ((data[-1]['close'] - data[0]['open']) / data[0]['open'] * 100) if data else None
-            } for symbol, data in spot_klines_data.items()
-        },
-        "futures_klines_summary": {
-            symbol: {
-                "count": len(data),
-                "time_range": f"{data[0]['open_time']} to {data[-1]['close_time']}" if data else "No data",
-                "latest_price": data[-1]['close'] if data else None,
-                "price_change_pct": ((data[-1]['close'] - data[0]['open']) / data[0]['open'] * 100) if data else None
-            } for symbol, data in futures_klines_data.items()
-        },
-        "spot_trend_analysis": spot_trend_analysis,
-        "futures_trend_analysis": futures_trend_analysis,
-        "spot_anomalies": spot_anomalies,
-        "futures_anomalies": futures_anomalies,
-        "spot_funding_pressure": spot_funding_pressure,
-        "futures_funding_pressure": futures_funding_pressure,
-        "spot_order_books": {k: v for k, v in spot_order_books.items() if v is not None},
-        "futures_order_books": {k: v for k, v in futures_order_books.items() if v is not None}
-    }
-
-    # 添加现货和期货的资金流向对比数据
-    funding_flow_comparison = {}
-    for symbol in SYMBOLS:
-        spot_data = spot_klines_data.get(symbol, [])
-        futures_data = futures_klines_data.get(symbol, [])
-
-        if spot_data and futures_data:
-            # 获取最近10个周期的资金流向数据
-            recent_spot_inflows = [k['net_inflow'] for k in spot_data[-10:]]
-            recent_futures_inflows = [k['net_inflow'] for k in futures_data[-10:]]
-
-            # 计算现货和期货资金流向的差异
-            spot_total_inflow = sum(recent_spot_inflows)
-            futures_total_inflow = sum(recent_futures_inflows)
-            flow_difference = spot_total_inflow - futures_total_inflow
-
-            # 计算现货和期货资金流向的相关性
-            if len(recent_spot_inflows) == len(recent_futures_inflows) and len(recent_spot_inflows) > 1:
-                correlation = np.corrcoef(recent_spot_inflows, recent_futures_inflows)[0, 1]
-            else:
-                correlation = None
-
-            funding_flow_comparison[symbol] = {
-                "spot_total_inflow": spot_total_inflow,
-                "futures_total_inflow": futures_total_inflow,
-                "flow_difference": flow_difference,
-                "correlation": correlation,
-                "dominant_market": "spot" if spot_total_inflow > futures_total_inflow else "futures",
-                "flow_ratio": abs(spot_total_inflow / futures_total_inflow) if futures_total_inflow != 0 else float(
-                    'inf')
-            }
-
-    deepseek_data["funding_flow_comparison"] = funding_flow_comparison
-
-    # 添加价格与资金流向的领先/滞后关系分析
-    lead_lag_analysis = {}
-    for symbol in SYMBOLS:
-        spot_data = spot_klines_data.get(symbol, [])
-
-        if len(spot_data) > 10:
-            prices = [k['close'] for k in spot_data]
-            inflows = [k['net_inflow'] for k in spot_data]
-
-            # 计算不同滞后期的相关性
-            correlations = []
-            for lag in range(-5, 6):  # 从-5到5的滞后期
-                if lag < 0:
-                    # 资金流向领先于价格
-                    corr = np.corrcoef(inflows[:lag], prices[-lag:])[0, 1]
-                elif lag > 0:
-                    # 价格领先于资金流向
-                    corr = np.corrcoef(inflows[lag:], prices[:-lag])[0, 1]
-                else:
-                    # 同期相关性
-                    corr = np.corrcoef(inflows, prices)[0, 1]
-
-                correlations.append((lag, corr))
-
-            # 找出最大相关性的滞后期
-            max_corr_lag = max(correlations, key=lambda x: abs(x[1]))
-
-            lead_lag_analysis[symbol] = {
-                "max_correlation": max_corr_lag[1],
-                "optimal_lag": max_corr_lag[0],
-                "relationship": "资金流向领先于价格" if max_corr_lag[0] < 0 else "价格领先于资金流向" if max_corr_lag[
-                                                                                                             0] > 0 else "同步变化",
-                "all_correlations": correlations
-            }
-
-    deepseek_data["lead_lag_analysis"] = lead_lag_analysis
-
-    # 格式化数值
-    for symbol in SYMBOLS:
-        if symbol in deepseek_data["spot_klines_summary"]:
-            if deepseek_data["spot_klines_summary"][symbol]["latest_price"]:
-                deepseek_data["spot_klines_summary"][symbol]["latest_price"] = format_number(
-                    deepseek_data["spot_klines_summary"][symbol]["latest_price"])
-
-        if symbol in deepseek_data["futures_klines_summary"]:
-            if deepseek_data["futures_klines_summary"][symbol]["latest_price"]:
-                deepseek_data["futures_klines_summary"][symbol]["latest_price"] = format_number(
-                    deepseek_data["futures_klines_summary"][symbol]["latest_price"])
-
-    # 发送分析请求
-    logger.info("正在请求DeepSeek API进行数据解读...")
-    analysis = send_to_deepseek(deepseek_data)
-
-    # 保存结果
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    analysis_filename = f"binance_analysis_{timestamp}.md"
-    
-    with open(analysis_filename, "w", encoding="utf-8") as f:
-        f.write(analysis)
-    logger.info(f"分析结果已保存到 {analysis_filename}")
-
-    # 发送Telegram消息
-    logger.info("正在发送Telegram消息...")
-    message_header = f"# CEX资金流向分析 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    
-    # 创建完整消息
-    full_message = message_header + analysis
-    
-    # 由于发送为图片，无需担心Telegram消息长度限制
-    send_telegram_message(full_message, as_image=True)
-
-    # 打印分析结果
-    print("\n分析结果:")
-    print(analysis)
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
 
 
-def job():
-    """定时执行的任务"""
-    logger.info("执行定时分析任务...")
-    try:
-        main_optimized()
-        logger.info("定时分析任务完成")
-    except Exception as e:
-        logger.error(f"定时任务执行失败: {e}")
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
 
-
-if __name__ == "__main__":
-    try:
-        # 首次运行
-        main_optimized()
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        # 设置每小时运行一次
-        schedule.every(1).hour.do(job)
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        logger.info("已设置定时任务，程序将每小时更新一次分析结果")
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
         
-        # 持续运行，等待定时任务
-        while True:
-            schedule.run_pending()
-            time.sleep(60)  # 每分钟检查一次是否有待执行的任务
-    except KeyboardInterrupt:
-        logger.info("程序被用户中断")
-    except Exception as e:
-        logger.error(f"程序出错: {e}")
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
+
+                            if any(kw in original_cell_text_for_style.lower() for kw in ['看涨', '做多', '上涨', '突破', 'buying']):
+                                cell_content_color = (0, 130, 0)  # Green
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['看跌', '做空', '下跌', '暴跌', 'selling']):
+                                cell_content_color = (200, 0, 0)  # Red
+                            elif any(kw in original_cell_text_for_style.lower() for kw in ['警示', '风险', '异常', 'warning']):
+                                cell_content_color = (180, 80, 0) # Orange
+
+
+                            for line_in_cell in single_cell_wrapped_lines:
+                                draw.text(
+                                    (current_cell_x + cell_padding, cell_text_y_offset),
+                                    line_in_cell, font=font_to_use, fill=cell_content_color
+                                )
+                                cell_text_y_offset += line_heights['table_row']
+                            current_cell_x += col_widths[c_idx]
+                        
+                        # Horizontal line for each row
+                        draw.line((padding, current_table_y + current_row_height, image_width - padding, current_table_y + current_row_height),
+                                  fill=table_border_color, width=1)
+                        current_table_y += current_row_height + (line_spacing // 2 if r_idx < len(wrapped_cells) -1 else 0)
+
+                    # Vertical lines for table
+                    v_line_x = padding
+                    for c_w in col_widths:
+                        draw.line((v_line_x, y_position, v_line_x, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0) ), 
+                                  fill=table_border_color, width=1)
+                        v_line_x += c_w
+                    # Last vertical line
+                    draw.line((image_width - padding, y_position, image_width - padding, current_table_y - (line_spacing//2 if len(wrapped_cells)>0 else 0)),
+                              fill=table_border_color, width=1)
+                    
+            y_position += item_calc_height # Advance y_position by the pre-calculated height for this item
+        
+        # Final flush for any pending code block at the end of the document
+        if in_code_block_drawing and code_block_lines_buffer:
+            first_line_y = code_block_rect_start_y # This might be off if y_pos was advanced
+            # Find the y_pos of the first code line in buffer to be accurate
+            buffered_code_block_h = sum(lh for _,_,_,_,lh,_ in code_block_lines_buffer)
+            
+            # Re-calculate y_start for buffered code block if y_position changed due to other elements
+            # This needs careful thought. For now, assume code_block_rect_start_y was correctly set when block started.
+            # It implies y_position for code lines in _calculate_wrapped_dimensions was used to set this start_y.
+
+            draw.rectangle(
+                (padding - 5, code_block_rect_start_y - (line_spacing//2), 
+                 image_width - padding + 5, code_block_rect_start_y + buffered_code_block_h - (line_spacing//2) + 5),
+                fill=highlight_color
+            )
+            temp_y_for_code = code_block_rect_start_y
+            for code_l_type, code_l_orig, code_l_params, _, code_l_h, code_l_wrapped in code_block_lines_buffer:
+                if code_l_wrapped and isinstance(code_l_wrapped, list):
+                     for sub_code_line in code_l_wrapped:
+                        draw.text((padding, temp_y_for_code), sub_code_line, font=fonts['code'], fill=text_color)
+                        temp_y_for_code += line_heights['code'] + (line_spacing // 2)
+                        # temp_y_for_code += (code_l_h - (line_spacing //2) ) # Advance by its calculated height (Error in previous version)
+                        # Corrected: temp_y_for_code is advanced by the sum of sub-line heights for this buffered item.
+                        # The code_l_item_h already accounts for this from the calculation phase.
+                        temp_y_for_code += code_l_h
+                
+                in_code_block_drawing = False
+                code_block_lines_buffer = []
+                # y_position is already advanced by _calculate_wrapped_dimensions, so just continue
+
+            elif line_type == 'code_block_marker':
+                if not in_code_block_drawing: # Start of a code block
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position # Mark Y for the background rect
+                # The flush logic at the start of the loop or end of file will handle drawing
+                # y_position advances by item_calc_height which is small for marker
+
+            elif line_type == 'code': # Inside a code block
+                if not in_code_block_drawing: # Should be set by marker, but safety
+                    in_code_block_drawing = True
+                    code_block_rect_start_y = y_position 
+                
+                # Buffer this line's data instead of drawing immediately
+                # The actual drawing happens when the block ends or another type starts
+                code_block_lines_buffer.append((line_type, original_content, params, item_calc_width, item_calc_height, wrapped_sub_data))
+                # y_position still advances based on _calculate_wrapped_dimensions for this line
+            
+            elif line_type == 'divider':
+                div_y = y_position + line_heights['divider'] // 2
+                draw.line((padding, div_y, image_width - padding, div_y), fill=table_border_color, width=1)
+
+            elif line_type == 'table':
+                if wrapped_sub_data:
+                    wrapped_cells, col_widths, raw_table_content = wrapped_sub_data
+                    num_actual_cols = len(col_widths)
+                    
+                    current_table_y = y_position
+                    for r_idx, row_wrapped_cells in enumerate(wrapped_cells):
+                        row_max_lines = 1
+                        for cell_lines in row_wrapped_cells:
+                            row_max_lines = max(row_max_lines, len(cell_lines))
+                        
+                        current_row_height = row_max_lines * line_heights['table_row']
+                        
+                        # Draw row background (header or alternating)
+                        if r_idx == 0: # Header
+                            draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=table_header_bg
+                            )
+                        elif r_idx % 2 != 0: # Odd rows (after header) can have slightly different bg
+                             draw.rectangle(
+                                (padding, current_table_y, image_width - padding, current_table_y + current_row_height),
+                                fill=(248, 248, 248) # Very light grey for alternating rows
+                            )
+
+
+                        current_cell_x = padding
+                        for c_idx, single_cell_wrapped_lines in enumerate(row_wrapped_cells):
+                            if c_idx >= num_actual_cols: continue # Should not happen if data is consistent
+
+                            cell_text_y_offset = current_table_y + (current_row_height - len(single_cell_wrapped_lines) * line_heights['table_row']) / 2 # Center vertically somewhat
+                            
+                            font_to_use = fonts['bold'] if r_idx == 0 else fonts['regular']
+                            cell_content_color = text_color
+                            
+                            # Try to get original cell text for styling keywords, assuming wrapped_cells structure matches raw_table_content
+                            original_cell_text_for_style = ""
+                            if r_idx < len(raw_table_content) and c_idx < len(raw_table_content[r_idx]):
+                                original_cell_text_for_style = raw_table_content[r_idx][c_idx]
