@@ -750,10 +750,10 @@ async def send_telegram_message_async(message, as_image=True):
                 logger.info("成功发送Telegram图片消息")
                 return True
             else:
-                logger.error("图片生成失败，尝试发送文本消息")
+                # logger.error("图片生成失败，尝试发送文本消息")
                 # 如果图片生成失败，回退到发送文本消息
-                await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
-                logger.info("成功发送Telegram文本消息")
+                # await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
+                # logger.info("成功发送Telegram文本消息")
                 return True
         else:
             # 发送文本消息
