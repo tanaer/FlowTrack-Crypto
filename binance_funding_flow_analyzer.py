@@ -718,30 +718,48 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         # 设置字体和颜色
         background_color = (255, 255, 255)  # 白色背景
         text_color = (0, 0, 0)  # 黑色文字
-        watermark_color = (180, 180, 180)  # 灰色水印
+        watermark_color = (220, 220, 220)  # 更淡的灰色水印
         highlight_color = (230, 230, 230)  # 代码块背景色
         quote_color = (100, 100, 100)  # 引用文字颜色
         table_header_bg = (240, 240, 240)  # 表头背景色
         table_border = (200, 200, 200)  # 表格边框颜色
         link_color = (0, 0, 255)  # 链接颜色
         
-        # 设置字体 (使用系统默认等宽字体)
+        # 设置字体 (优先使用系统字体)
         try:
-            # 尝试使用微软雅黑等中文字体
-            font_path = "AlibabaPuHuiTi-3-55-Regular.ttf"
-            font = ImageFont.truetype(font_path, 16)
-            title_font = ImageFont.truetype(font_path, 24)
-            h2_font = ImageFont.truetype(font_path, 22)
-            h3_font = ImageFont.truetype(font_path, 20)
-            bold_font = ImageFont.truetype(font_path, 16)
-            code_font = ImageFont.truetype(font_path, 14)
-            watermark_font = ImageFont.truetype(font_path, 20)
-        except:
+            # 尝试使用常见中文字体
+            font_paths = [
+                "AlibabaPuHuiTi-3-55-Regular.ttf",  # 自定义字体
+                "C:/Windows/Fonts/msyh.ttc",        # 微软雅黑
+                "C:/Windows/Fonts/simhei.ttf",      # 黑体
+                "C:/Windows/Fonts/simsun.ttc"       # 宋体
+            ]
+            
+            font_path = None
+            for path in font_paths:
+                if os.path.exists(path):
+                    font_path = path
+                    logger.info(f"使用字体: {path}")
+                    break
+                    
+            if font_path:
+                font = ImageFont.truetype(font_path, 16)
+                title_font = ImageFont.truetype(font_path, 24)
+                h2_font = ImageFont.truetype(font_path, 22)
+                h3_font = ImageFont.truetype(font_path, 20)
+                bold_font = ImageFont.truetype(font_path, 16)
+                code_font = ImageFont.truetype(font_path, 14)
+                watermark_font = ImageFont.truetype(font_path, 20)
+            else:
+                raise Exception("未找到可用字体")
+                
+        except Exception as e:
+            logger.warning(f"加载自定义字体失败: {e}，使用默认字体")
             # 如果找不到系统字体，使用默认字体
             font = ImageFont.load_default()
             title_font = ImageFont.load_default()
-            h2_font = title_font
-            h3_font = title_font
+            h2_font = font
+            h3_font = font
             bold_font = font
             code_font = font
             watermark_font = font
@@ -765,10 +783,10 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         max_table_width = 0
         for line_type, content, _ in parsed_lines:
             if line_type == 'table' and isinstance(content, list):
-                table_width = max(len(row) for row in content)
+                table_width = max(len(row) for row in content) if content else 0
                 max_table_width = max(max_table_width, table_width)
         
-        image_width = max(800, max(max_line_length * 10, max_table_width * 15))
+        image_width = max(1000, max(max_line_length * 8, max_table_width * 15))
         
         # 计算总高度
         total_height = 0
@@ -795,15 +813,22 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
             else:
                 total_height += line_height[line_type] if line_type in line_height else line_height['text']
                 
-        # 添加边距
+        # 添加边距和页脚空间
         padding = 20
-        image_height = total_height + 2 * padding
+        footer_height = 130  # 为页脚和二维码预留空间
+        image_height = total_height + 2 * padding + footer_height
         
-        # 创建图片
+        # 创建图片(背景色为白色)
         image = Image.new('RGB', (image_width, image_height), background_color)
         draw = ImageDraw.Draw(image)
         
-        # 绘制文本
+        # 添加淡色背景水印(对角线水印)
+        for i in range(0, image_width + image_height, 300):
+            x1 = max(0, i - image_height)
+            y1 = max(0, image_height - i)
+            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(245, 245, 245))
+            
+        # 绘制文本内容
         y_position = padding
         in_code_block = False
         code_block_start_y = 0
@@ -826,9 +851,16 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
             if line_type == 'header':
                 level = params.get('level', 1)
                 if level == 1:
+                    # 主标题加粗突出
                     draw.text((padding, y_position), content, font=title_font, fill=text_color)
-                    y_position += line_height['header']
+                    # 在标题下方添加分隔线
+                    y_position += line_height['header'] - 5
+                    draw.line((padding, y_position, image_width - padding, y_position), 
+                              fill=table_border, width=2)
+                    y_position += 5
                 elif level == 2:
+                    # 二级标题前添加空间
+                    y_position += 5
                     draw.text((padding, y_position), content, font=h2_font, fill=text_color)
                     y_position += line_height['h2']
                 else:
@@ -847,30 +879,36 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                 for segment in segments:
                     if isinstance(segment, tuple):
                         if segment[0] == 'text':
-                            seg_width = draw.textlength(segment[1], font=font)
-                            draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
-                            x_pos += seg_width
+                            # 确保内容不为空
+                            if segment[1].strip():
+                                seg_width = draw.textlength(segment[1], font=font)
+                                draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
+                                x_pos += seg_width
                         elif segment[0] == 'bold':
-                            seg_width = draw.textlength(segment[1], font=bold_font)
-                            draw.text((x_pos, y_position), segment[1], font=bold_font, fill=text_color)
-                            x_pos += seg_width
+                            if segment[1].strip():
+                                seg_width = draw.textlength(segment[1], font=bold_font)
+                                draw.text((x_pos, y_position), segment[1], font=bold_font, fill=text_color)
+                                x_pos += seg_width
                         elif segment[0] == 'italic':
-                            seg_width = draw.textlength(segment[1], font=font)
-                            # 模拟斜体效果
-                            draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
-                            x_pos += seg_width
+                            if segment[1].strip():
+                                seg_width = draw.textlength(segment[1], font=font)
+                                # 模拟斜体效果
+                                draw.text((x_pos, y_position), segment[1], font=font, fill=text_color)
+                                x_pos += seg_width
                         elif segment[0] == 'inline_code':
-                            # 绘制内联代码背景
-                            seg_width = draw.textlength(segment[1], font=code_font)
-                            draw.rectangle((x_pos - 2, y_position - 2, 
-                                           x_pos + seg_width + 2, y_position + line_height['text'] - 2), 
-                                          fill=highlight_color)
-                            draw.text((x_pos, y_position), segment[1], font=code_font, fill=text_color)
-                            x_pos += seg_width + 4
+                            if segment[1].strip():
+                                # 绘制内联代码背景
+                                seg_width = draw.textlength(segment[1], font=code_font)
+                                draw.rectangle((x_pos - 2, y_position - 2, 
+                                               x_pos + seg_width + 2, y_position + line_height['text'] - 2), 
+                                              fill=highlight_color)
+                                draw.text((x_pos, y_position), segment[1], font=code_font, fill=text_color)
+                                x_pos += seg_width + 4
                         elif segment[0] == 'link':
-                            seg_width = draw.textlength(segment[1], font=font)
-                            draw.text((x_pos, y_position), segment[1], font=font, fill=link_color)
-                            x_pos += seg_width
+                            if segment[1].strip():
+                                seg_width = draw.textlength(segment[1], font=font)
+                                draw.text((x_pos, y_position), segment[1], font=font, fill=link_color)
+                                x_pos += seg_width
                             
                 y_position += line_height['text']
                     
@@ -911,77 +949,136 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                 draw.text((padding, y_position), content, font=code_font, fill=text_color)
                 y_position += line_height['code']
                     
-            elif line_type == 'table' and isinstance(content, list):
-                if len(content) > 1:
-                    # 处理表格
-                    rows = []
-                    for row in content:
-                        if '|' in row:
-                            cells = [cell.strip() for cell in row.split('|')]
-                            # 移除空单元格（表格行首尾的|会产生空单元格）
-                            if not cells[0]:
-                                cells = cells[1:]
-                            if not cells[-1]:
-                                cells = cells[:-1]
-                            rows.append(cells)
+            elif line_type == 'table' and isinstance(content, list) and len(content) > 1:
+                # 处理表格
+                rows = []
+                for row in content:
+                    if '|' in row:
+                        cells = [cell.strip() for cell in row.split('|')]
+                        # 移除空单元格（表格行首尾的|会产生空单元格）
+                        if not cells[0]:
+                            cells = cells[1:]
+                        if not cells[-1]:
+                            cells = cells[:-1]
+                        rows.append(cells)
+                
+                if rows:
+                    col_count = max(len(row) for row in rows)
+                    col_width = (image_width - 2 * padding) // col_count
                     
-                    if rows:
-                        col_count = max(len(row) for row in rows)
-                        col_width = (image_width - 2 * padding) // col_count
+                    # 绘制表格
+                    for i, row in enumerate(rows):
+                        row_y = y_position
                         
-                        # 绘制表格
-                        for i, row in enumerate(rows):
-                            row_y = y_position
-                            # 表头背景
-                            if i == 0:
-                                draw.rectangle((padding, row_y, 
-                                               image_width - padding, row_y + line_height['table_row']),
-                                             fill=table_header_bg)
+                        # 表头背景 - 使用更深的颜色
+                        if i == 0:
+                            table_header_color = (230, 230, 230)  # 更深的灰色
+                            draw.rectangle((padding, row_y, image_width - padding, 
+                                           row_y + line_height['table_row']),
+                                         fill=table_header_color)
+                            
+                            # 在表头文字加粗处理
+                            for j, cell in enumerate(row):
+                                if j < col_count:  # 确保不超出列数
+                                    cell_x = padding + j * col_width
+                                    draw.text((cell_x + 5, row_y + 2), cell, font=bold_font, fill=text_color)
+                        
+                        # 非表头行 - 普通文本
+                        else:    
+                            # 使用交替的背景色提高可读性
+                            if i % 2 == 0:  # 偶数行使用浅灰色背景
+                                draw.rectangle((padding, row_y, image_width - padding,
+                                              row_y + line_height['table_row']),
+                                             fill=(248, 248, 248))
                             
                             # 绘制单元格内容
                             for j, cell in enumerate(row):
                                 if j < col_count:  # 确保不超出列数
                                     cell_x = padding + j * col_width
-                                    draw.text((cell_x + 5, row_y + 2), cell, font=font, fill=text_color)
-                            
-                            # 绘制表格横线
+                                    # 根据内容类型使用特殊颜色 (如上涨绿色，下跌红色等)
+                                    cell_color = text_color
+                                    if any(kw in cell.lower() for kw in ['看涨', '做多', '上涨', '突破']):
+                                        cell_color = (0, 130, 0)  # 绿色
+                                    elif any(kw in cell.lower() for kw in ['看跌', '做空', '下跌', '暴跌']):
+                                        cell_color = (200, 0, 0)  # 红色
+                                    elif any(kw in cell.lower() for kw in ['警示', '风险', '异常']):
+                                        cell_color = (180, 80, 0)  # 橙色警告
+                                        
+                                    draw.text((cell_x + 5, row_y + 2), cell, font=font, fill=cell_color)
+                        
+                        # 只在第一行绘制表格横线
+                        if i == 0 or i == len(rows) - 1:
                             draw.line((padding, row_y, image_width - padding, row_y), 
                                      fill=table_border, width=1)
-                            
-                            y_position += line_height['table_row']
                         
-                        # 最后一行的底线
-                        draw.line((padding, y_position, image_width - padding, y_position), 
-                                 fill=table_border, width=1)
+                        y_position += line_height['table_row']
+                    
+                    # 最后一行的底线
+                    draw.line((padding, y_position, image_width - padding, y_position), 
+                              fill=table_border, width=1)
+                    
+                    # 绘制表格竖线
+                    for j in range(col_count + 1):
+                        col_x = padding + j * col_width
+                        draw.line((col_x, y_position - len(rows) * line_height['table_row'], 
+                                  col_x, y_position), fill=table_border, width=1)
                         
-                        # 绘制表格竖线
-                        for j in range(col_count + 1):
-                            col_x = padding + j * col_width
-                            draw.line((col_x, y_position - len(rows) * line_height['table_row'], 
-                                     col_x, y_position), fill=table_border, width=1)
-                            
-                        y_position += 10  # 表格后添加一些空间
+                    y_position += 10  # 表格后添加一些空间
         
-        # 添加半透明水印（在图片四个角和中心）
-        watermark_positions = [
-            (padding, padding),  # 左上角
-            (image_width - padding - 300, padding),  # 右上角
-            (padding, image_height - padding - 30),  # 左下角
-            (image_width - padding - 300, image_height - padding - 30),  # 右下角
-            ((image_width - 300) // 2, (image_height - 30) // 2)  # 中心
-        ]
+        # 添加页脚和二维码
+        footer_y = y_position + 20
         
-        for x, y in watermark_positions:
-            draw.text((x, y), watermark, font=watermark_font, fill=watermark_color)
+        # 绘制页脚分隔线
+        draw.line((padding, footer_y, image_width - padding, footer_y), 
+                  fill=table_border, width=1)
+                  
+        # 添加注释信息
+        footnote = "注: 所有时间均为UTC时间，价格单位为USDT。数据截止2025-05-13 22:09:59，实际交易需结合实时数据验证。"
+        draw.text((padding, footer_y + 10), footnote, font=font, fill=(100, 100, 100))
+        
+        # 添加免责声明
+        disclaimer = "*免责声明: 本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
+        draw.text((padding, footer_y + 35), disclaimer, font=font, fill=(100, 100, 100))
             
-        # 在整个图片上添加淡色对角线水印
-        for i in range(0, image_width + image_height, 200):
-            x1 = max(0, i - image_height)
-            y1 = max(0, image_height - i)
-            x2 = min(i, image_width)
-            y2 = min(image_height, i + image_width - image_height)
-            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(240, 240, 240))
+        # 添加Telegram标识和二维码
+        try:
+            import qrcode
+            qr_data = "https://t.me/jin10light"
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=2,
+            )
+            qr.add_data(qr_data)
+            qr.make(fit=True)
             
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            
+            # 调整二维码大小
+            qr_size = 80
+            qr_img = qr_img.resize((qr_size, qr_size))
+            
+            # 计算二维码位置 (右下角)
+            qr_x = image_width - qr_size - padding
+            qr_y = footer_y + 10
+            
+            # 粘贴二维码
+            image.paste(qr_img, (qr_x, qr_y))
+            
+            # 在二维码旁边添加文字说明
+            tg_text = "Telegram: @jin10light"
+            tg_text_width = draw.textlength(tg_text, font=font)
+            draw.text((qr_x - tg_text_width - 10, qr_y + qr_size//2 - 10), 
+                      tg_text, font=font, fill=text_color)
+            
+        except Exception as e:
+            logger.error(f"添加二维码失败: {e}")
+            # 添加Telegram文本
+            tg_text = "Telegram: @jin10light"
+            draw.text((image_width - padding - 200, footer_y + 20), 
+                      tg_text, font=font, fill=text_color)
+
         # 将图片保存到内存缓冲区
         buffer = io.BytesIO()
         image.save(buffer, format='PNG')
@@ -989,7 +1086,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         
         return buffer
     except Exception as e:
-        logger.error(f"文本转图片失败: {e}")
+        logger.error(f"文本转图片失败: {e}", exc_info=True)
         return None
 
 
