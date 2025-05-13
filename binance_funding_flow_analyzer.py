@@ -574,70 +574,301 @@ def load_cached_data(filename):
 
 
 def text_to_image(text, watermark="Telegram: @jin10light"):
-    """将文本转换为图片，并添加水印"""
+    """将文本转换为图片，并添加水印和二维码"""
     try:
+        import qrcode
+        from PIL import Image, ImageDraw, ImageFont, ImageColor
+        from io import BytesIO
+        import re
+        
         # 设置字体和颜色
         background_color = (255, 255, 255)  # 白色背景
         text_color = (0, 0, 0)  # 黑色文字
         watermark_color = (180, 180, 180)  # 灰色水印
+        title_color = (31, 35, 40)  # 深灰色标题
         
-        # 准备文本内容
-        lines = text.split('\n')
-        max_line_length = max(len(line) for line in lines)
-        
-        # 设置字体 (使用系统默认等宽字体)
+        # 准备字体
         try:
-            # 尝试使用微软雅黑等中文字体
+            # 尝试使用阿里巴巴普惠体等中文字体
             font_path = "AlibabaPuHuiTi-3-55-Regular.ttf"
-            font = ImageFont.truetype(font_path, 16)
-            title_font = ImageFont.truetype(font_path, 24)
-            watermark_font = ImageFont.truetype(font_path, 20)
-        except:
+            bold_font_path = "AlibabaPuHuiTi-3-65-Medium.ttf"
+           
+            # 加载字体
+            if font_path and os.path.exists(font_path):
+                regular_font = ImageFont.truetype(font_path, 18)
+                bold_font = ImageFont.truetype(bold_font_path if os.path.exists(bold_font_path) else font_path, 18)
+                title_font = ImageFont.truetype(bold_font_path if os.path.exists(bold_font_path) else font_path, 26)
+                subtitle_font = ImageFont.truetype(bold_font_path if os.path.exists(bold_font_path) else font_path, 22)
+                watermark_font = ImageFont.truetype(font_path, 20)
+            else:
+                raise FileNotFoundError("找不到字体文件")
+                
+        except Exception as e:
+            logger.warning(f"加载自定义字体失败: {e}，使用默认字体")
             # 如果找不到系统字体，使用默认字体
-            font = ImageFont.load_default()
+            regular_font = ImageFont.load_default()
+            bold_font = ImageFont.load_default()
             title_font = ImageFont.load_default()
+            subtitle_font = ImageFont.load_default()
             watermark_font = ImageFont.load_default()
         
-        # 计算图片大小
-        line_height = 20
-        padding = 20
-        image_width = max(800, max_line_length * 10)  # 确保至少800像素宽
-        image_height = (len(lines) + 5) * line_height + 2 * padding
+        # 解析Markdown
+        lines = text.split('\n')
         
-        # 创建图片
+        # 计算图片大小
+        line_height = 24  # 增加行高以提高可读性
+        padding = 30
+        table_padding = 8
+        
+        # 预处理Markdown确定图片宽度
+        max_line_length = 0
+        in_table = False
+        table_columns = []
+        table_data = []
+        current_table_row = []
+        
+        for line in lines:
+            # 如果是表格分隔线，跳过长度计算
+            if re.match(r'^\|[\-\|]+\|$', line):
+                in_table = True
+                continue
+                
+            # 如果是表格行
+            if line.startswith('|') and line.endswith('|'):
+                in_table = True
+                columns = [col.strip() for col in line.split('|')[1:-1]]
+                if not table_columns and in_table:
+                    table_columns = columns
+                else:
+                    current_table_row = columns
+                    if columns:  # 确保不是空行
+                        table_data.append(columns)
+                        
+                # 计算表格行长度（包括边距）
+                table_width = sum(len(col) * 11 for col in columns) + (len(columns) + 1) * table_padding
+                max_line_length = max(max_line_length, table_width)
+            else:
+                # 重置表格状态
+                if in_table:
+                    in_table = False
+                    
+                # 处理普通文本行，计算最大长度
+                # 去除Markdown标记计算实际显示长度
+                clean_line = re.sub(r'\*\*(.*?)\*\*', r'\1', line)  # 去除加粗标记
+                clean_line = re.sub(r'##+ ', '', clean_line)  # 去除标题标记
+                max_line_length = max(max_line_length, len(clean_line) * 11)  # 估计每个字符11像素宽
+                
+        # 确保至少1000像素宽
+        image_width = max(1000, max_line_length + padding * 2)
+        
+        # 处理表格，增加表格宽度以避免文字溢出
+        if table_columns:
+            col_widths = []
+            for i in range(len(table_columns)):
+                # 计算此列的最大宽度
+                col_width = len(table_columns[i]) * 11
+                for row in table_data:
+                    if i < len(row):
+                        col_width = max(col_width, len(row[i]) * 11)
+                col_widths.append(col_width + table_padding * 2)
+                
+            # 表格总宽度加上边框
+            table_total_width = sum(col_widths) + table_padding * 2
+            image_width = max(image_width, table_total_width + padding * 2)
+        
+        # 估计图片高度
+        estimated_lines = len(lines) * 1.5  # 考虑表格和标题可能需要额外空间
+        image_height = int(estimated_lines * line_height + padding * 2)
+        
+        # 创建图片，增加尺寸确保内容完整显示
         image = Image.new('RGB', (image_width, image_height), background_color)
         draw = ImageDraw.Draw(image)
         
         # 绘制文本
         y_position = padding
+        in_table = False
+        table_header = []
+        table_rows = []
+        skip_next = False
+        
         for i, line in enumerate(lines):
-            # 第一行作为标题使用大号字体
-            if i == 0 and line.startswith('#'):
-                draw.text((padding, y_position), line, font=title_font, fill=text_color)
+            if skip_next:
+                skip_next = False
+                continue
+                
+            # 处理表格分隔线
+            if re.match(r'^\|[\-\|]+\|$', line):
+                in_table = True
+                continue
+                
+            # 处理表格
+            if line.startswith('|') and line.endswith('|'):
+                columns = [col.strip() for col in line.split('|')[1:-1]]
+                
+                if not in_table:  # 表格开始
+                    in_table = True
+                    table_header = columns
+                    table_rows = []
+                else:  # 表格行
+                    if columns and all(col for col in columns):  # 确保不是空行或分隔线
+                        table_rows.append(columns)
+                        
+                # 如果是最后一行或下一行不是表格，则绘制表格
+                if i == len(lines) - 1 or not lines[i+1].startswith('|'):
+                    # 计算列宽
+                    col_widths = []
+                    for col_idx in range(len(table_header)):
+                        header_width = draw.textlength(table_header[col_idx], font=bold_font)
+                        max_width = header_width
+                        for row in table_rows:
+                            if col_idx < len(row):
+                                cell_text = row[col_idx]
+                                # 处理单元格中的加粗文本
+                                cell_text = re.sub(r'\*\*(.*?)\*\*', r'\1', cell_text)
+                                cell_width = draw.textlength(cell_text, font=regular_font)
+                                max_width = max(max_width, cell_width)
+                        col_widths.append(max_width + table_padding * 2)
+                    
+                    # 绘制表格
+                    table_width = sum(col_widths)
+                    table_x = padding
+                    table_y = y_position
+                    
+                    # 绘制表头
+                    x = table_x
+                    for col_idx, header in enumerate(table_header):
+                        cell_width = col_widths[col_idx]
+                        # 绘制单元格背景
+                        draw.rectangle([(x, table_y), (x + cell_width, table_y + line_height)], 
+                                      fill=(240, 240, 240))
+                        # 绘制表头文本(加粗)
+                        draw.text((x + table_padding, table_y + 3), header, font=bold_font, fill=text_color)
+                        x += cell_width
+                    
+                    table_y += line_height
+                    
+                    # 绘制表格行
+                    for row in table_rows:
+                        x = table_x
+                        max_height = line_height  # 默认行高
+                        
+                        # 绘制行
+                        for col_idx, cell in enumerate(row):
+                            if col_idx < len(col_widths):
+                                cell_width = col_widths[col_idx]
+                                
+                                # 处理单元格中的加粗文本
+                                bold_spans = re.findall(r'\*\*(.*?)\*\*', cell)
+                                if bold_spans:
+                                    # 有加粗文本，分段绘制
+                                    plain_text = re.sub(r'\*\*(.*?)\*\*', r'__BOLD__\1__BOLD__', cell)
+                                    parts = plain_text.split('__BOLD__')
+                                    offset = 0
+                                    using_bold = False
+                                    for part in parts:
+                                        if not part:  # 跳过空字符串
+                                            using_bold = not using_bold
+                                            continue
+                                            
+                                        font = bold_font if using_bold else regular_font
+                                        draw.text((x + table_padding + offset, table_y + 3), 
+                                                 part, font=font, fill=text_color)
+                                        offset += draw.textlength(part, font=font)
+                                        using_bold = not using_bold
+                                else:
+                                    # 无加粗文本，直接绘制
+                                    draw.text((x + table_padding, table_y + 3), 
+                                             cell, font=regular_font, fill=text_color)
+                                
+                                # 更新X坐标
+                                x += cell_width
+                        
+                        table_y += max_height
+                    
+                    # 绘制表格边框
+                    for i in range(len(table_header) + 1):
+                        x = table_x
+                        if i > 0:
+                            x += sum(col_widths[:i])
+                        draw.line([(x, y_position), (x, table_y)], fill=(200, 200, 200), width=1)
+                    
+                    for i in range(len(table_rows) + 2):
+                        y = y_position + i * line_height
+                        draw.line([(table_x, y), (table_x + table_width, y)], 
+                                 fill=(200, 200, 200), width=1)
+                    
+                    y_position = table_y + line_height  # 表格后增加间距
+                    in_table = False  # 重置表格状态
+                
+                continue
+                
+            # 处理标题（#开头）
+            if line.startswith('# '):
+                draw.text((padding, y_position), line[2:], font=title_font, fill=title_color)
+                y_position += line_height * 1.8
+            elif line.startswith('## '):
+                draw.text((padding, y_position), line[3:], font=subtitle_font, fill=title_color)
                 y_position += line_height * 1.5
+            elif line.startswith('### '):
+                draw.text((padding, y_position), line[4:], font=bold_font, fill=title_color)
+                y_position += line_height * 1.3
+            # 处理加粗文本和普通文本
             else:
-                draw.text((padding, y_position), line, font=font, fill=text_color)
+                # 查找所有加粗文本
+                bold_spans = re.findall(r'\*\*(.*?)\*\*', line)
+                if bold_spans:
+                    # 有加粗文本，分段绘制
+                    plain_text = re.sub(r'\*\*(.*?)\*\*', r'__BOLD__\1__BOLD__', line)
+                    parts = plain_text.split('__BOLD__')
+                    x_position = padding
+                    using_bold = False
+                    for part in parts:
+                        if not part:  # 跳过空字符串
+                            using_bold = not using_bold
+                            continue
+                            
+                        font = bold_font if using_bold else regular_font
+                        draw.text((x_position, y_position), part, font=font, fill=text_color)
+                        x_position += draw.textlength(part, font=font)
+                        using_bold = not using_bold
+                else:
+                    # 无加粗文本，直接绘制
+                    draw.text((padding, y_position), line, font=regular_font, fill=text_color)
+                
                 y_position += line_height
         
-        # 添加半透明水印（在图片四个角和中心）
-        watermark_positions = [
-            (padding, padding),  # 左上角
-            (image_width - padding - 300, padding),  # 右上角
-            (padding, image_height - padding - 30),  # 左下角
-            (image_width - padding - 300, image_height - padding - 30),  # 右下角
-            ((image_width - 300) // 2, (image_height - 30) // 2)  # 中心
-        ]
+        # 修正图片高度，裁剪未使用的空间
+        image = image.crop((0, 0, image_width, y_position + padding))
         
-        for x, y in watermark_positions:
-            draw.text((x, y), watermark, font=watermark_font, fill=watermark_color)
-            
-        # 在整个图片上添加淡色对角线水印
-        for i in range(0, image_width + image_height, 200):
-            x1 = max(0, i - image_height)
-            y1 = max(0, image_height - i)
+        # 创建二维码
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data("https://t.me/jin10light")
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        
+        # 调整二维码大小（适当缩小）
+        qr_size = 100
+        qr_img = qr_img.resize((qr_size, qr_size))
+        
+        # 将二维码放在右下角
+        image.paste(qr_img, (image_width - qr_size - padding, image.height - qr_size - padding))
+        
+        # 添加水印文本在左下角
+        draw = ImageDraw.Draw(image)
+        draw.text((padding, image.height - 30), watermark, font=watermark_font, fill=watermark_color)
+        
+        # 添加半透明对角线水印
+        for i in range(0, image_width + image.height, 300):
+            x1 = max(0, i - image.height)
+            y1 = max(0, image.height - i)
             x2 = min(i, image_width)
-            y2 = min(image_height, i + image_width - image_height)
-            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(240, 240, 240))
+            y2 = min(image.height, i + image_width - image.height)
+            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(245, 245, 245))
             
         # 将图片保存到内存缓冲区
         buffer = io.BytesIO()
@@ -647,6 +878,8 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         return buffer
     except Exception as e:
         logger.error(f"文本转图片失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
 
