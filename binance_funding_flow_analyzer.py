@@ -13,6 +13,11 @@ from binance.client import Client
 from typing import Dict, List
 import logging
 from scipy import stats
+import configparser
+
+# 加载配置文件
+config = configparser.ConfigParser()
+config.read('config.ini')
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,15 +29,15 @@ FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1"
 
 # DeepSeek API 配置
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_API_KEY = ""  # 替换为实际的API Key
+DEEPSEEK_API_KEY = config.get('API', 'DEEPSEEK_API_KEY')  # 从配置文件读取
 
 # Binance 客户端初始化
-BINANCE_API_KEY = ""  # 替换为你的Binance API Key
-BINANCE_API_SECRET = ""  # 替换为你的Binance API Secret
+BINANCE_API_KEY = config.get('API', 'BINANCE_API_KEY')  # 从配置文件读取
+BINANCE_API_SECRET = config.get('API', 'BINANCE_API_SECRET')  # 从配置文件读取
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # 固定交易对
-SYMBOLS = ['BTCUSDT', 'ETHUSDT']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SUIUSDT', 'TONUSDT', 'PNUTSUSDT']
 
 
 def format_number(value):
