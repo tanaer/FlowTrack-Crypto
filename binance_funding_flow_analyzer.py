@@ -628,7 +628,7 @@ def send_to_deepseek(data):
 
             "请使用专业术语，保持分析简洁但深入。数据如下：\n\n" +
             json.dumps(simplified_data, indent=2, ensure_ascii=False) +
-            "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析。"
+            "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析，不要使用mermaid内容。"
     )
 
     # 按配置顺序依次尝试各个API
@@ -941,7 +941,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
                 total_height += len(code_lines) * line_height + 30
         
         # 添加页脚空间
-        total_height += 100
+        total_height += 150
         
         # 创建图像 - 使用计算出的宽度
         img_width = min_img_width
@@ -1103,7 +1103,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         watermark_font = small_font
         watermark_text_width = draw.textlength(watermark, font=watermark_font)
         
-        for i in range(0, img_width + img_height, 280):  # 减少水印密度
+        for i in range(0, img_width + img_height, 200):  # 减少水印密度
             x = max(0, i - img_height)
             y = max(0, img_height - i)
             draw.text((x + 50, y + 50), watermark, font=watermark_font, fill=watermark_color)
@@ -1124,7 +1124,7 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         qr_img = qr.make_image(fill_color="black", back_color="white")
         
         # 调整二维码大小
-        qr_size = 80
+        qr_size = 160
         qr_img = qr_img.resize((qr_size, qr_size))
         
         # 将二维码放在右下角
