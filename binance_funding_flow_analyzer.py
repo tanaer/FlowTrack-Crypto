@@ -4,8 +4,8 @@ import numpy as np
 from datetime import datetime
 import time
 import concurrent.futures
-import telegram
-from telegram.ext import Updater
+from telegram import Bot
+from telegram.constants import ParseMode
 import json
 import pickle
 from ratelimit import limits, sleep_and_retry
@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import textwrap
 import os
+import asyncio
 
 # 加载配置文件
 config = configparser.ConfigParser()
@@ -649,38 +650,57 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         return None
 
 
-def send_telegram_message(message, parse_mode='Markdown', as_image=True):
-    """发送Telegram消息，可选择发送为图片"""
+async def send_telegram_message_async(message, as_image=True):
+    """异步发送Telegram消息"""
     try:
         bot_token = config.get('TELEGRAM', 'BOT_TOKEN')
         chat_id = config.get('TELEGRAM', 'CHAT_ID')
         
-        bot = telegram.Bot(token=bot_token)
         # 在消息最后加上免责声明
         if not message.endswith("*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"):
             message += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
-            
+        
+        bot = Bot(token=bot_token)
+        
         if as_image:
             # 将消息转换为图片
             image_buffer = text_to_image(message)
             if image_buffer:
-                # 发送图片
-                bot.send_photo(chat_id=chat_id, photo=image_buffer)
+                # 异步发送图片
+                await bot.send_photo(chat_id=chat_id, photo=image_buffer)
                 logger.info("成功发送Telegram图片消息")
                 return True
             else:
                 logger.error("图片生成失败，尝试发送文本消息")
                 # 如果图片生成失败，回退到发送文本消息
-                bot.send_message(chat_id=chat_id, text=message, parse_mode=parse_mode)
+                await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
                 logger.info("成功发送Telegram文本消息")
                 return True
         else:
             # 直接发送文本消息
-            bot.send_message(chat_id=chat_id, text=message, parse_mode=parse_mode)
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
             logger.info("成功发送Telegram文本消息")
             return True
     except Exception as e:
         logger.error(f"发送Telegram消息时出错: {e}")
+        return False
+
+def send_telegram_message(message, as_image=True):
+    """发送Telegram消息的同步包装函数"""
+    try:
+        # 创建新的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 运行异步函数
+        result = loop.run_until_complete(send_telegram_message_async(message, as_image))
+        
+        # 关闭事件循环
+        loop.close()
+        
+        return result
+    except Exception as e:
+        logger.error(f"执行Telegram异步消息发送时出错: {e}")
         return False
 
 
