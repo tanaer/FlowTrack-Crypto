@@ -37,7 +37,7 @@ SPOT_BASE_URL = "https://api.binance.com/api/v3"
 FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1"
 
 # DeepSeek API 配置
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_API_URL = "https://api.deepseek.ai/v1/chat/completions"  # 修正API URL
 DEEPSEEK_API_KEY = config.get('API', 'DEEPSEEK_API_KEY')  # 从配置文件读取
 
 # Binance 客户端初始化
@@ -510,6 +510,37 @@ def send_to_deepseek(data):
         "Content-Type": "application/json"
     }
 
+    # 简化数据，减小请求大小
+    simplified_data = {}
+    for symbol, symbol_data in data.items():
+        simplified_data[symbol] = {
+            'spot': {
+                'trend': symbol_data['spot']['trend'],
+                'pressure': symbol_data['spot']['pressure'],
+                'anomalies': symbol_data['spot']['anomalies'][:5] if symbol_data['spot']['anomalies'] else []
+            },
+            'futures': {
+                'trend': symbol_data['futures']['trend'],
+                'pressure': symbol_data['futures']['pressure'],
+                'anomalies': symbol_data['futures']['anomalies'][:5] if symbol_data['futures']['anomalies'] else []
+            }
+        }
+        
+        # 添加订单簿摘要信息
+        if symbol_data['spot']['orderbook']:
+            simplified_data[symbol]['spot']['orderbook_summary'] = {
+                'volume_imbalance': symbol_data['spot']['orderbook'].get('volume_imbalance', 0),
+                'value_imbalance': symbol_data['spot']['orderbook'].get('value_imbalance', 0),
+                'price': symbol_data['spot']['orderbook'].get('price', 0)
+            }
+            
+        if symbol_data['futures']['orderbook']:
+            simplified_data[symbol]['futures']['orderbook_summary'] = {
+                'volume_imbalance': symbol_data['futures']['orderbook'].get('volume_imbalance', 0),
+                'value_imbalance': symbol_data['futures']['orderbook'].get('value_imbalance', 0),
+                'price': symbol_data['futures']['orderbook'].get('price', 0)
+            }
+
     prompt = (
             "## Binance资金流向专业分析任务\n\n"
             "我已收集了Binance现货和期货市场过去50根5分钟K线的资金流向数据（已剔除最新未完成的一根），包括：\n"
@@ -527,13 +558,13 @@ def send_to_deepseek(data):
             "   - 特别关注资金流向与价格变化不匹配的异常情况\n\n"
 
             "2. **价格阶段判断**：\n"
-            "   - 根据资金流向趋势和价格关系，判断各交易对处于什么阶段（顶部、底部、上涨中、下跌中、整理中）\n"
+            "   - 根据资金流向趋势和价格关系，判断各交易对处于什么阶段\n"
             "   - 提供判断的置信度和依据\n"
             "   - 对比不同交易对的阶段差异，分析可能的轮动关系\n\n"
 
             "3. **短期趋势预判**：\n"
             "   - 基于资金流向和资金压力分析，预判未来4-8小时可能的价格走势\n"
-            "   - 识别可能的反转信号或趋势延续信号\n"
+            "   - 识别可能的反转信号或趋势延续信号\n\n"
             "   - 关注异常交易数据可能暗示的短期行情变化\n\n"
 
             "4. **交易策略建议**：\n"
@@ -541,26 +572,111 @@ def send_to_deepseek(data):
             "   - 提供可能的入场点位和止损位\n"
             "   - 评估风险和回报比\n\n"
 
-            "请使用专业术语，保持分析简洁但深入，避免泛泛而谈。数据如下：\n\n" +
-            json.dumps(data, indent=2, ensure_ascii=False) +
+            "请使用专业术语，保持分析简洁但深入。数据如下：\n\n" +
+            json.dumps(simplified_data, indent=2, ensure_ascii=False) +
             "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析。"
     )
 
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000,
-        "temperature": 0.7
-    }
-
     try:
+        # 首先测试连接
+        # logger.info("正在测试DeepSeek API连接...")
+        # test_payload = {
+        #     "model": "deepseek-chat",
+        #     "messages": [{"role": "user", "content": "Hello"}],
+        #     "max_tokens": 10
+        # }
+        
+        # test_response = requests.post(DEEPSEEK_API_URL, headers=headers, json=test_payload)
+        # if test_response.status_code != 200:
+        #     logger.error(f"DeepSeek API连接测试失败: HTTP {test_response.status_code}, {test_response.text}")
+        #     # 尝试使用modelscope或者Claude API替代
+        #     return generate_fallback_analysis(simplified_data)
+            
+        # logger.info("DeepSeek API连接测试成功，开始分析数据...")
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2000,
+            "temperature": 0.7
+        }
+
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload)
         response.raise_for_status()
         result = response.json()
         return result['choices'][0]['message']['content']
     except Exception as e:
         logger.error(f"DeepSeek API error: {e}")
-        return "无法获取DeepSeek分析结果"
+        logger.error(f"请求详情: URL={DEEPSEEK_API_URL}, Headers={headers}, Payload长度={len(prompt)}")
+        if 'response' in locals():
+            logger.error(f"响应状态码: {response.status_code}, 响应内容: {response.text}")
+        
+        # 尝试使用备用方案
+        return generate_fallback_analysis(simplified_data)
+
+def generate_fallback_analysis(data):
+    """当DeepSeek API失败时，生成基本分析结果"""
+    logger.info("使用本地分析逻辑生成基本分析结果")
+    
+    analysis = "# Telegram @jin10light 区块链资金流向报告\n\n"
+    analysis += "## 一、资金行为解读\n\n"
+    
+    for symbol, symbol_data in data.items():
+        spot_trend = symbol_data['spot']['trend']
+        futures_trend = symbol_data['futures']['trend']
+        spot_pressure = symbol_data['spot']['pressure']
+        futures_pressure = symbol_data['futures']['pressure']
+        
+        analysis += f"### {symbol} 分析\n\n"
+        analysis += f"- **现货趋势**: {spot_trend.get('trend', '未知')}, 置信度: {spot_trend.get('confidence', 0):.2f}\n"
+        analysis += f"- **期货趋势**: {futures_trend.get('trend', '未知')}, 置信度: {futures_trend.get('confidence', 0):.2f}\n"
+        analysis += f"- **现货资金压力**: {spot_pressure.get('direction', '未知')}, 强度: {spot_pressure.get('strength', 0):.2f}\n"
+        analysis += f"- **期货资金压力**: {futures_pressure.get('direction', '未知')}, 强度: {futures_pressure.get('strength', 0):.2f}\n\n"
+        
+        # 处理异常情况
+        spot_anomalies = symbol_data['spot'].get('anomalies', [])
+        futures_anomalies = symbol_data['futures'].get('anomalies', [])
+        
+        if spot_anomalies or futures_anomalies:
+            analysis += "**异常情况**:\n\n"
+            
+            if spot_anomalies:
+                analysis += "现货异常:\n"
+                for anomaly in spot_anomalies:
+                    analysis += f"- {anomaly.get('type', '未知类型')} 于 {anomaly.get('timestamp', '未知时间')}\n"
+            
+            if futures_anomalies:
+                analysis += "期货异常:\n"
+                for anomaly in futures_anomalies:
+                    analysis += f"- {anomaly.get('type', '未知类型')} 于 {anomaly.get('timestamp', '未知时间')}\n"
+            
+            analysis += "\n"
+    
+    analysis += "## 二、策略建议\n\n"
+    
+    for symbol, symbol_data in data.items():
+        spot_trend = symbol_data['spot']['trend']['trend'] if 'trend' in symbol_data['spot'] and 'trend' in symbol_data['spot']['trend'] else "未知"
+        futures_trend = symbol_data['futures']['trend']['trend'] if 'trend' in symbol_data['futures'] and 'trend' in symbol_data['futures']['trend'] else "未知"
+        
+        analysis += f"### {symbol} 策略\n\n"
+        
+        # 基于趋势提供简单建议
+        if spot_trend == 'rising' and futures_trend == 'rising':
+            analysis += "**建议**: 可考虑逢低做多，注意设置止损\n\n"
+        elif spot_trend == 'falling' and futures_trend == 'falling':
+            analysis += "**建议**: 可考虑逢高做空，注意设置止损\n\n"
+        elif spot_trend == 'consolidation' or futures_trend == 'consolidation':
+            analysis += "**建议**: 目前处于整理阶段，建议观望等待突破\n\n"
+        elif spot_trend == 'top' or futures_trend == 'top':
+            analysis += "**建议**: 可能处于顶部区域，谨慎操作，可考虑减仓\n\n"
+        elif spot_trend == 'bottom' or futures_trend == 'bottom':
+            analysis += "**建议**: 可能处于底部区域，可考虑分批建仓\n\n"
+        else:
+            analysis += "**建议**: 当前趋势不明确，建议观望或轻仓操作\n\n"
+    
+    # analysis += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险*"
+    
+    return analysis
 
 
 def cache_data(data, filename):
@@ -583,8 +699,8 @@ async def send_telegram_message_async(message, as_image=True):
         chat_id = config.get('TELEGRAM', 'CHAT_ID')
         
         # 在消息最后加上免责声明
-        if not message.endswith("*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"):
-            message += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
+        # if not message.endswith("*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"):
+        #     message += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
         
         bot = Bot(token=bot_token)
         
