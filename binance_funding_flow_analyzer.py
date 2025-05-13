@@ -1251,10 +1251,28 @@ if __name__ == "__main__":
             print("BOT_TOKEN = 你的Telegram Bot Token")
             print("CHAT_ID = 你的Telegram聊天ID")
             exit(1)
+        
+        # 定义包装函数以执行异步main函数
+        def run_analysis():
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - 开始执行Binance资金流向分析...")
+            asyncio.run(main())
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - 分析完成")
+        
+        # 设置每小时执行一次
+        schedule.every().hour.do(run_analysis)
+        
+        print("程序已启动，将每小时执行一次分析")
+        print(f"首次分析将在 {datetime.now().replace(minute=0, second=0, microsecond=0) + pd.Timedelta(hours=1)} 执行")
+        print("你也可以按 Ctrl+C 停止程序")
+        
+        # 立即执行一次
+        run_analysis()
+        
+        # 持续运行并检查调度任务
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
             
-        print("开始执行Binance资金流向分析...")
-        # 执行主函数
-        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n程序被用户中断")
     except Exception as e:
