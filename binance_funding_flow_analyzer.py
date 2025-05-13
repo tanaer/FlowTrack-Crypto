@@ -949,6 +949,10 @@ def text_to_image(text, watermark="Telegram: @jin10light"):
         
         logger.info(f"图片尺寸: 宽度={img_width}, 高度={img_height}, 最长文本宽度={max_text_width}")
         
+        # 确保图像尺寸为整数
+        img_width = int(img_width)
+        img_height = int(img_height)
+        
         image = Image.new('RGB', (img_width, img_height), background_color)
         draw = ImageDraw.Draw(image)
         
