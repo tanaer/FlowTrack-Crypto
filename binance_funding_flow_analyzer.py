@@ -36,14 +36,8 @@ logger = logging.getLogger(__name__)
 SPOT_BASE_URL = "https://api.binance.com/api/v3"
 FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1"
 
-# DeepSeek API 配置
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"  # 修正API URL
-DEEPSEEK_API_KEY = config.get('API', 'DEEPSEEK_API_KEY')  # 从配置文件读取
-
-# 备选LLM API配置
-LLM_API_MODEL = config.get('API', 'LLM_API_MODEL', fallback='deepseek/deepseek-v3-0324')
-LLM_API_KEY = config.get('API', 'LLM_API_KEY', fallback='')
-LLM_API_BASE = config.get('API', 'LLM_API_BASE', fallback='https://api.ppinfra.com/v3/openai')
+# 从配置文件读取LLM API调用顺序
+LLM_API_PROVIDERS = config.get('API', 'LLM_API_PROVIDERS', fallback='deepseek,ppinfra,local').split(',')
 
 # Binance 客户端初始化
 BINANCE_API_KEY = config.get('API', 'BINANCE_API_KEY')  # 从配置文件读取
@@ -508,13 +502,67 @@ def analyze_funding_pressure(klines_data: List[Dict], orderbook: Dict) -> Dict:
     }
 
 
-def send_to_deepseek(data):
-    """将数据发送给DeepSeek API并获取解读，如果失败则使用备选API"""
+def call_llm_api(provider, prompt):
+    """通用LLM API调用函数
+    
+    Args:
+        provider: API提供商名称，例如'deepseek'或'ppinfra'
+        prompt: 要发送的提示文本
+        
+    Returns:
+        API响应内容，或者在失败时抛出异常
+    """
+    logger.info(f"正在使用 {provider} API 生成分析...")
+    
+    # 根据提供商配置参数
+    if provider == 'deepseek':
+        api_url = config.get('API', 'DEEPSEEK_API_URL')
+        api_key = config.get('API', 'DEEPSEEK_API_KEY')
+        model = config.get('API', 'DEEPSEEK_API_MODEL')
+    elif provider == 'ppinfra':
+        api_url = config.get('API', 'PPINFRA_API_URL')
+        api_key = config.get('API', 'PPINFRA_API_KEY')
+        model = config.get('API', 'PPINFRA_API_MODEL')
+    else:
+        raise ValueError(f"不支持的API提供商: {provider}")
+    
+    # 准备请求
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
+    
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000,
+        "temperature": 0.7
+    }
+    
+    # 发送请求
+    endpoint = '/chat/completions'
+    if not api_url.endswith(endpoint):
+        # 确保URL格式正确
+        if api_url.endswith('/'):
+            api_url = api_url[:-1]
+        if not api_url.endswith('/v1') and not api_url.endswith('/v3'):
+            api_url = f"{api_url}{endpoint}"
+        else:
+            api_url = f"{api_url}{endpoint}"
+    
+    logger.info(f"调用API: {api_url}, 模型: {model}")
+    
+    response = requests.post(api_url, headers=headers, json=payload)
+    response.raise_for_status()  # 如果请求失败，抛出异常
+    
+    result = response.json()
+    
+    logger.info(f"{provider} API调用成功")
+    return result['choices'][0]['message']['content']
 
+
+def send_to_deepseek(data):
+    """按照配置的顺序尝试使用各个LLM API进行分析"""
     # 简化数据，减小请求大小
     simplified_data = {}
     for symbol, symbol_data in data.items():
@@ -546,6 +594,7 @@ def send_to_deepseek(data):
                 'price': symbol_data['futures']['orderbook'].get('price', 0)
             }
 
+    # 构建提示文本
     prompt = (
             "## Binance资金流向专业分析任务\n\n"
             "我已收集了Binance现货和期货市场过去50根5分钟K线的资金流向数据（已剔除最新未完成的一根），包括：\n"
@@ -563,7 +612,7 @@ def send_to_deepseek(data):
             "   - 特别关注资金流向与价格变化不匹配的异常情况\n\n"
 
             "2. **价格阶段判断**：\n"
-            "   - 根据资金流向趋势和价格关系，判断各交易对处于什么阶段\n"
+            "   - 根据资金流向趋势和价格关系，判断各交易对处于什么阶段（顶部、底部、上涨中、下跌中、整理中等）\n"
             "   - 提供判断的置信度和依据\n"
             "   - 对比不同交易对的阶段差异，分析可能的轮动关系\n\n"
 
@@ -582,60 +631,25 @@ def send_to_deepseek(data):
             "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析。"
     )
 
-    try:
-        # 尝试使用DeepSeek API
-        logger.info("使用DeepSeek API进行分析...")
-        
-        payload = {
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2000,
-            "temperature": 0.7
-        }
-
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        result = response.json()
-        return result['choices'][0]['message']['content']
-    except Exception as e:
-        logger.error(f"DeepSeek API error: {e}")
-        logger.error(f"请求详情: URL={DEEPSEEK_API_URL}, Headers={headers}, Payload长度={len(prompt)}")
-        if 'response' in locals():
-            logger.error(f"响应状态码: {response.status_code}, 响应内容: {response.text}")
-        
-        # 尝试使用备选API
+    # 按配置顺序依次尝试各个API
+    for provider in LLM_API_PROVIDERS:
         try:
-            if LLM_API_KEY:
-                logger.info(f"DeepSeek API失败，尝试使用备选API: {LLM_API_BASE}")
-                return use_backup_llm_api(prompt)
-            else:
-                logger.warning("备选API密钥未配置，使用本地分析逻辑")
+            if provider == 'local':
+                logger.info("使用本地分析生成结果")
                 return generate_fallback_analysis(simplified_data)
-        except Exception as backup_e:
-            logger.error(f"备选API调用失败: {backup_e}")
-            return generate_fallback_analysis(simplified_data)
+            else:
+                return call_llm_api(provider, prompt)
+        except Exception as e:
+            logger.error(f"{provider} API调用失败: {e}")
+            if provider == LLM_API_PROVIDERS[-1]:
+                # 如果是最后一个提供商也失败，则生成本地分析
+                logger.warning("所有配置的API都调用失败，使用本地分析")
+                return generate_fallback_analysis(simplified_data)
+            else:
+                # 否则继续尝试下一个提供商
+                logger.info(f"尝试下一个API提供商: {LLM_API_PROVIDERS[LLM_API_PROVIDERS.index(provider) + 1]}")
+                continue
 
-def use_backup_llm_api(prompt):
-    """使用备选的LLM API"""
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": LLM_API_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000,
-        "temperature": 0.7
-    }
-    
-    logger.info(f"使用备选API: {LLM_API_BASE}, 模型: {LLM_API_MODEL}")
-    response = requests.post(f"{LLM_API_BASE}/chat/completions", headers=headers, json=payload)
-    response.raise_for_status()
-    result = response.json()
-    
-    logger.info("备选API调用成功")
-    return result['choices'][0]['message']['content']
 
 def generate_fallback_analysis(data):
     """当API调用全部失败时，生成基本分析结果"""
