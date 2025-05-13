@@ -14,6 +14,11 @@ from typing import Dict, List
 import logging
 from scipy import stats
 import configparser
+import schedule
+from PIL import Image, ImageDraw, ImageFont
+import io
+import textwrap
+import os
 
 # 加载配置文件
 config = configparser.ConfigParser()
@@ -37,7 +42,7 @@ BINANCE_API_SECRET = config.get('API', 'BINANCE_API_SECRET')  # 从配置文件�
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # 固定交易对
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SUIUSDT', 'TONUSDT', 'PNUTSUSDT']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SUIUSDT', 'TONUSDT', 'PNUTUSDT']
 
 
 def format_number(value):
@@ -53,25 +58,74 @@ def format_number(value):
 @sleep_and_retry
 @limits(calls=20, period=1)
 def get_klines_data(symbol: str, interval: str = '5m', limit: int = 50, is_futures: bool = False) -> List[Dict]:
-    """获取K线数据，并剔除最新的一根（未完成的）"""
+    """获取K线数据，并剔除最新的一根（未完成的）
+    
+    根据Binance API文档获取K线数据：
+    - 现货: /api/v3/klines
+    - 期货: /fapi/v1/klines
+    
+    参数:
+        symbol: 交易对名称
+        interval: K线周期 (1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M)
+        limit: 获取的K线数量，默认50，最大1500
+        is_futures: 是否为期货
+        
+    返回:
+        K线数据列表，已剔除最新的未完成K线
+    """
     try:
+        # 确定API基础URL和端点
         base_url = FUTURES_BASE_URL if is_futures else SPOT_BASE_URL
         endpoint = "/klines"
-        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+        
+        # 检查并限制limit参数
+        if limit > 1500:
+            logger.warning(f"请求的limit({limit})超过最大值1500，已自动调整为1500")
+            limit = 1500
+            
+        # 构建请求参数
+        params = {
+            'symbol': symbol, 
+            'interval': interval, 
+            'limit': limit + 1  # 多请求一根，以便剔除最新的未完成K线
+        }
+        
+        # 发送请求获取K线数据
+        logger.info(f"正在获取 {symbol} {'期货' if is_futures else '现货'} {interval} K线数据...")
         response = requests.get(f"{base_url}{endpoint}", params=params)
+        
+        # 检查请求是否成功
+        if response.status_code != 200:
+            logger.error(f"获取K线数据失败: HTTP {response.status_code}, {response.text}")
+            return []
+            
         data = response.json()
 
+        # 检查返回的数据量
+        if not data:
+            logger.warning(f"{symbol} 未返回任何K线数据")
+            return []
+            
         if len(data) < 2:
-            logger.warning(f"需要至少2根K线数据，但{symbol}只返回了{len(data)}根")
+            logger.warning(f"需要至少2根K线数据以剔除最新未完成K线，但{symbol}只返回了{len(data)}根")
             return []
 
         # 剔除最新的一根K线（未完成的）
-        data = data[:-1]
+        complete_klines = data[:-1]
+        logger.info(f"成功获取 {symbol} K线数据: {len(complete_klines)}根 (已剔除最新未完成K线)")
 
+        # 将K线数据转换为结构化格式
         results = []
-        for k in data:
+        for k in complete_klines:
+            # 将时间戳转换为可读时间格式
             open_time = datetime.fromtimestamp(k[0] / 1000).strftime('%Y-%m-%d %H:%M:%S')
             close_time = datetime.fromtimestamp(k[6] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
+            # 计算净流入资金 (买方成交量 - 卖方成交量)
+            taker_buy_quote_volume = float(k[10])  # 主动买入成交额
+            total_quote_volume = float(k[7])       # 总成交额
+            taker_sell_quote_volume = total_quote_volume - taker_buy_quote_volume  # 主动卖出成交额
+            net_inflow = taker_buy_quote_volume - taker_sell_quote_volume  # 净流入 = 买入 - 卖出
 
             results.append({
                 'symbol': symbol,
@@ -81,18 +135,20 @@ def get_klines_data(symbol: str, interval: str = '5m', limit: int = 50, is_futur
                 'high': float(k[2]),
                 'low': float(k[3]),
                 'close': float(k[4]),
-                'volume': float(k[5]),
-                'quote_volume': float(k[7]),
-                'trades': int(k[8]),
-                'taker_buy_base_volume': float(k[9]),
-                'taker_buy_quote_volume': float(k[10]),
-                'net_inflow': float(k[10]) - (float(k[7]) - float(k[10])),  # 买方成交量 - 卖方成交量
-                'timestamp': k[0]  # 保存时间戳用于排序
+                'volume': float(k[5]),              # 成交量(基础资产数量)
+                'quote_volume': total_quote_volume, # 成交额(计价资产数量)
+                'trades': int(k[8]),                # 成交笔数
+                'taker_buy_base_volume': float(k[9]),           # 主动买入成交量
+                'taker_buy_quote_volume': taker_buy_quote_volume, # 主动买入成交额
+                'taker_sell_quote_volume': taker_sell_quote_volume, # 主动卖出成交额
+                'net_inflow': net_inflow,           # 净流入资金
+                'buy_ratio': taker_buy_quote_volume / total_quote_volume if total_quote_volume > 0 else 0,  # 买盘比例
+                'timestamp': k[0]                   # 原始时间戳(毫秒)，用于排序
             })
 
         return results
     except Exception as e:
-        logger.error(f"获取{symbol} K线数据时出错: {e}")
+        logger.error(f"获取{symbol} K线数据时出错: {str(e)}")
         return []
 
 
@@ -516,6 +572,118 @@ def load_cached_data(filename):
         return None
 
 
+def text_to_image(text, watermark="Telegram: @jin10light"):
+    """将文本转换为图片，并添加水印"""
+    try:
+        # 设置字体和颜色
+        background_color = (255, 255, 255)  # 白色背景
+        text_color = (0, 0, 0)  # 黑色文字
+        watermark_color = (180, 180, 180)  # 灰色水印
+        
+        # 准备文本内容
+        lines = text.split('\n')
+        max_line_length = max(len(line) for line in lines)
+        
+        # 设置字体 (使用系统默认等宽字体)
+        try:
+            # 尝试使用微软雅黑等中文字体
+            font_path = "AlibabaPuHuiTi-3-55-Regular.ttf"
+            font = ImageFont.truetype(font_path, 16)
+            title_font = ImageFont.truetype(font_path, 24)
+            watermark_font = ImageFont.truetype(font_path, 20)
+        except:
+            # 如果找不到系统字体，使用默认字体
+            font = ImageFont.load_default()
+            title_font = ImageFont.load_default()
+            watermark_font = ImageFont.load_default()
+        
+        # 计算图片大小
+        line_height = 20
+        padding = 20
+        image_width = max(800, max_line_length * 10)  # 确保至少800像素宽
+        image_height = (len(lines) + 5) * line_height + 2 * padding
+        
+        # 创建图片
+        image = Image.new('RGB', (image_width, image_height), background_color)
+        draw = ImageDraw.Draw(image)
+        
+        # 绘制文本
+        y_position = padding
+        for i, line in enumerate(lines):
+            # 第一行作为标题使用大号字体
+            if i == 0 and line.startswith('#'):
+                draw.text((padding, y_position), line, font=title_font, fill=text_color)
+                y_position += line_height * 1.5
+            else:
+                draw.text((padding, y_position), line, font=font, fill=text_color)
+                y_position += line_height
+        
+        # 添加半透明水印（在图片四个角和中心）
+        watermark_positions = [
+            (padding, padding),  # 左上角
+            (image_width - padding - 300, padding),  # 右上角
+            (padding, image_height - padding - 30),  # 左下角
+            (image_width - padding - 300, image_height - padding - 30),  # 右下角
+            ((image_width - 300) // 2, (image_height - 30) // 2)  # 中心
+        ]
+        
+        for x, y in watermark_positions:
+            draw.text((x, y), watermark, font=watermark_font, fill=watermark_color)
+            
+        # 在整个图片上添加淡色对角线水印
+        for i in range(0, image_width + image_height, 200):
+            x1 = max(0, i - image_height)
+            y1 = max(0, image_height - i)
+            x2 = min(i, image_width)
+            y2 = min(image_height, i + image_width - image_height)
+            draw.text((x1 + 50, y1 + 50), watermark, font=watermark_font, fill=(240, 240, 240))
+            
+        # 将图片保存到内存缓冲区
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        return buffer
+    except Exception as e:
+        logger.error(f"文本转图片失败: {e}")
+        return None
+
+
+def send_telegram_message(message, parse_mode='Markdown', as_image=True):
+    """发送Telegram消息，可选择发送为图片"""
+    try:
+        bot_token = config.get('TELEGRAM', 'BOT_TOKEN')
+        chat_id = config.get('TELEGRAM', 'CHAT_ID')
+        
+        bot = telegram.Bot(token=bot_token)
+        # 在消息最后加上免责声明
+        if not message.endswith("*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"):
+            message += "\n\n*免责声明：本分析仅供专业参考，不构成投资建议，交易决策请自行承担风险"
+            
+        if as_image:
+            # 将消息转换为图片
+            image_buffer = text_to_image(message)
+            if image_buffer:
+                # 发送图片
+                bot.send_photo(chat_id=chat_id, photo=image_buffer)
+                logger.info("成功发送Telegram图片消息")
+                return True
+            else:
+                logger.error("图片生成失败，尝试发送文本消息")
+                # 如果图片生成失败，回退到发送文本消息
+                bot.send_message(chat_id=chat_id, text=message, parse_mode=parse_mode)
+                logger.info("成功发送Telegram文本消息")
+                return True
+        else:
+            # 直接发送文本消息
+            bot.send_message(chat_id=chat_id, text=message, parse_mode=parse_mode)
+            logger.info("成功发送Telegram文本消息")
+            return True
+    except Exception as e:
+        logger.error(f"发送Telegram消息时出错: {e}")
+        return False
+
+
 def main_optimized():
     logger.info(f"开始运行，当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"目标交易对: {SYMBOLS}")
@@ -688,14 +856,52 @@ def main_optimized():
 
     # 保存结果
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with open(f"binance_analysis.md", "w", encoding="utf-8") as f:
+    analysis_filename = f"binance_analysis_{timestamp}.md"
+    
+    with open(analysis_filename, "w", encoding="utf-8") as f:
         f.write(analysis)
-    logger.info(f"分析结果已保存到 binance_analysis_{timestamp}.md")
+    logger.info(f"分析结果已保存到 {analysis_filename}")
+
+    # 发送Telegram消息
+    logger.info("正在发送Telegram消息...")
+    message_header = f"# CEX资金流向分析 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    # 创建完整消息
+    full_message = message_header + analysis
+    
+    # 由于发送为图片，无需担心Telegram消息长度限制
+    send_telegram_message(full_message, as_image=True)
 
     # 打印分析结果
     print("\n分析结果:")
     print(analysis)
 
 
+def job():
+    """定时执行的任务"""
+    logger.info("执行定时分析任务...")
+    try:
+        main_optimized()
+        logger.info("定时分析任务完成")
+    except Exception as e:
+        logger.error(f"定时任务执行失败: {e}")
+
+
 if __name__ == "__main__":
-    main_optimized()
+    try:
+        # 首次运行
+        main_optimized()
+        
+        # 设置每小时运行一次
+        schedule.every(1).hour.do(job)
+        
+        logger.info("已设置定时任务，程序将每小时更新一次分析结果")
+        
+        # 持续运行，等待定时任务
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # 每分钟检查一次是否有待执行的任务
+    except KeyboardInterrupt:
+        logger.info("程序被用户中断")
+    except Exception as e:
+        logger.error(f"程序出错: {e}")
