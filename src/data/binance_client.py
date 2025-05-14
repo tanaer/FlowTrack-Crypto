@@ -2,14 +2,13 @@
 
 负责与币安API交互，获取市场数据。
 """
-import requests
 import time
 import logging
 from datetime import datetime
 from typing import Dict, List
 from binance.client import Client
 from ratelimit import limits, sleep_and_retry
-from ..config import BINANCE_API_KEY, BINANCE_API_SECRET, SPOT_BASE_URL, FUTURES_BASE_URL
+from ..config import BINANCE_API_KEY, BINANCE_API_SECRET
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -26,9 +25,9 @@ except Exception as e:
 def get_klines_data(symbol: str, interval: str = '5m', limit: int = 50, is_futures: bool = False) -> List[Dict]:
     """获取K线数据，并剔除最新的一根（未完成的）
     
-    根据Binance API文档获取K线数据：
-    - 现货: /api/v3/klines
-    - 期货: /fapi/v1/klines
+    使用python-binance库获取K线数据：
+    - 现货: client.get_klines
+    - 期货: client.futures_klines
     
     参数:
         symbol: 交易对名称
@@ -40,32 +39,19 @@ def get_klines_data(symbol: str, interval: str = '5m', limit: int = 50, is_futur
         K线数据列表，已剔除最新的未完成K线
     """
     try:
-        # 确定API基础URL和端点
-        base_url = FUTURES_BASE_URL if is_futures else SPOT_BASE_URL
-        endpoint = "/klines"
-        
         # 检查并限制limit参数
         if limit > 1500:
             logger.warning(f"请求的limit({limit})超过最大值1500，已自动调整为1500")
             limit = 1500
             
-        # 构建请求参数
-        params = {
-            'symbol': symbol, 
-            'interval': interval, 
-            'limit': limit + 1  # 多请求一根，以便剔除最新的未完成K线
-        }
-        
-        # 发送请求获取K线数据
+        # 使用python-binance库获取K线数据
         logger.info(f"正在获取 {symbol} {'期货' if is_futures else '现货'} {interval} K线数据...")
-        response = requests.get(f"{base_url}{endpoint}", params=params)
         
-        # 检查请求是否成功
-        if response.status_code != 200:
-            logger.error(f"获取K线数据失败: HTTP {response.status_code}, {response.text}")
-            return []
-            
-        data = response.json()
+        # 根据是否为期货选择不同的API调用
+        if is_futures:
+            data = client.futures_klines(symbol=symbol, interval=interval, limit=limit + 1)
+        else:
+            data = client.get_klines(symbol=symbol, interval=interval, limit=limit + 1)
 
         # 检查返回的数据量
         if not data:
@@ -121,10 +107,14 @@ def get_klines_data(symbol: str, interval: str = '5m', limit: int = 50, is_futur
 @sleep_and_retry
 @limits(calls=20, period=1)
 def get_orderbook_stats(symbol: str, is_futures: bool = False, retries: int = 3) -> Dict:
-    """获取单个交易对的深度统计数据（现货5000档，期货1000档）"""
+    """获取单个交易对的深度统计数据（现货5000档，期货1000档）
+    
+    使用python-binance库获取订单簿数据
+    """
     limit = 1000 if is_futures else 5000  # 期货支持最大1000档，现货支持5000档
     for attempt in range(retries):
         try:
+            # 使用python-binance库获取订单簿和当前价格
             if is_futures:
                 orderbook = client.futures_order_book(symbol=symbol, limit=limit)
                 current_price = float(client.futures_symbol_ticker(symbol=symbol)['price'])

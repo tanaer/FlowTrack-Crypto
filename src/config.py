@@ -30,10 +30,6 @@ try:
     # 从配置文件读取LLM API调用顺序
     LLM_API_PROVIDERS = config.get('API', 'LLM_API_PROVIDERS', fallback='deepseek,ppinfra,local').split(',')
 
-    # Binance API端点
-    SPOT_BASE_URL = "https://api.binance.com/api/v3"
-    FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1"
-
     # Binance API密钥
     BINANCE_API_KEY = config.get('API', 'BINANCE_API_KEY')
     BINANCE_API_SECRET = config.get('API', 'BINANCE_API_SECRET')

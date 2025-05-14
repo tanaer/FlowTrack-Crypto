@@ -1,0 +1,100 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# FlowTrack-Crypto 项目变更记录
+
+## 重构概述 (2023-09-25)
+
+将原单文件程序 `binance_funding_flow_analyzer.py` 重构为模块化结构，提高代码可维护性、可扩展性和可读性。
+
+### 主要变更
+
+#### 目录结构
+
+创建了模块化的目录结构：
+
+```
+FlowTrack-Crypto/
+├── config.ini
+├── run.py                 # 外部启动脚本
+├── src/
+│   ├── __init__.py
+│   ├── main.py            # 主程序入口
+│   ├── config.py          # 配置管理
+│   ├── data/              # 数据获取模块
+│   │   ├── __init__.py
+│   │   └── binance_client.py
+│   ├── analysis/          # 分析模块
+│   │   ├── __init__.py
+│   │   └── market_analysis.py
+│   ├── api/               # API调用模块
+│   │   ├── __init__.py
+│   │   └── llm_client.py
+│   ├── notification/      # 通知模块
+│   │   ├── __init__.py
+│   │   └── telegram_sender.py
+│   └── utils/             # 工具函数
+│       ├── __init__.py
+│       ├── caching.py
+│       └── fallback.py
+```
+
+#### 功能模块化
+
+1. **配置管理** (`config.py`)
+   - 集中管理应用程序配置
+   - 加载和验证配置文件
+
+2. **数据获取** (`data/binance_client.py`)
+   - 从币安API获取K线数据
+   - 获取订单簿数据
+
+3. **市场分析** (`analysis/market_analysis.py`)
+   - 分析资金流向趋势
+   - 检测异常交易
+   - 分析资金压力
+
+4. **AI分析** (`api/llm_client.py`) 
+   - 调用外部LLM API进行分析
+   - 提供API失败后的回退方案
+
+5. **通知发送** (`notification/telegram_sender.py`)
+   - 发送Telegram消息
+   - 将markdown文本转换为图片
+
+6. **工具函数** (`utils/`)
+   - 数据缓存功能
+   - 本地分析回退逻辑
+
+#### 修复的问题
+
+1. 修复图像生成过程中的错误：`'float' object cannot be interpreted as an integer`
+   - 确保图像尺寸被转换为整数值
+
+2. 改进对mermaid图表的处理
+   - 添加前置处理步骤，将mermaid代码块替换为文本描述
+
+#### 新增功能
+
+1. 定时任务功能
+   - 使用schedule库设置每小时自动执行分析
+   - 可通过命令行参数控制立即执行或定时执行
+
+2. 独立的启动脚本 (`run.py`)
+   - 提供更友好的启动界面
+   - 支持不同的启动模式
+
+## 下一步计划
+
+1. 添加单元测试
+2. 增加数据可视化功能
+3. 支持更多交易对的配置
+4. 优化AI分析的提示词
+5. 添加Web界面
+
+## 主要贡献者
+
+- Claude (AI助手) - 代码重构与优化
+
