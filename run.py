@@ -50,7 +50,9 @@ if __name__ == "__main__":
             try:
                 while True:
                     schedule.run_pending()
-                    time.sleep(1)
+                    from src.simulation.trade_simulator import backtest_open_orders
+                    backtest_open_orders()  # 每分钟自动回测模拟订单
+                    time.sleep(60)
             except KeyboardInterrupt:
                 print("\n程序被用户中断")
         

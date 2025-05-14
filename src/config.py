@@ -35,7 +35,8 @@ try:
     BINANCE_API_SECRET = config.get('API', 'BINANCE_API_SECRET')
 
     # 固定交易对
-    SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SUIUSDT', 'TONUSDT', 'PNUTUSDT']
+    #SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SUIUSDT', 'TONUSDT', 'PNUTUSDT']
+    SYMBOLS = ['SUIUSDT']
     
 except Exception as e:
     logger.error(f"加载配置失败: {e}")

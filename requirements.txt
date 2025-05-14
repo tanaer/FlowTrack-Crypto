@@ -1,0 +1,12 @@
+python-binance>=1.0.28
+pandas
+numpy
+scipy
+schedule
+requests
+python-telegram-bot
+markdown
+beautifulsoup4
+ratelimit
+pillow
+qrcode

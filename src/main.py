@@ -15,6 +15,8 @@ from .data.binance_client import get_klines_data, get_orderbook_stats, client
 from .analysis.market_analysis import analyze_funding_flow_trend, detect_anomalies, analyze_funding_pressure
 from .api.llm_client import generate_analysis
 from .notification.telegram_sender import send_telegram_message_async
+from .analysis.result_manager import save_analysis_result
+from .simulation.trade_simulator import parse_ai_strategy, save_sim_orders, stat_sim_results, get_sim_orders_24h
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -47,12 +49,12 @@ async def main():
             logger.info(f"开始获取 {symbol} 数据")
             
             # 获取现货K线数据
-            spot_klines = get_klines_data(symbol, interval='5m', limit=50, is_futures=False)
+            spot_klines = get_klines_data(symbol, interval='5m', limit=200, is_futures=False)
             if not spot_klines:
                 logger.warning(f"{symbol} 现货K线数据获取失败")
                 
             # 获取期货K线数据
-            futures_klines = get_klines_data(symbol, interval='5m', limit=50, is_futures=True)
+            futures_klines = get_klines_data(symbol, interval='5m', limit=200, is_futures=True)
             if not futures_klines:
                 logger.warning(f"{symbol} 期货K线数据获取失败")
                 
@@ -95,10 +97,29 @@ async def main():
         # 发送数据到AI进行解读
         logger.info("发送数据到AI服务进行解读")
         analysis_result = generate_analysis(all_results)
+
+        # 保存本次分析结果
+        save_analysis_result(analysis_result)
+        
+        # 解析AI策略并模拟下单
+        sim_orders = parse_ai_strategy(analysis_result)
+        if sim_orders:
+            save_sim_orders(sim_orders)
+            logger.info(f"本轮模拟下单 {len(sim_orders)} 笔，已保存")
+        else:
+            logger.info("未检测到AI策略建议，未模拟下单")
+        
+        # 统计模拟交易胜率等信息
+        sim_stat = stat_sim_results()
+        stat_md = f"\n\n---\n**模拟交易统计（近全部历史）**\n\n- 总单数: {sim_stat['total']}\n- 胜率: {sim_stat['win_rate']*100:.2f}%\n- 总盈利: {sim_stat['profit']} USDT\n- 总亏损: {sim_stat['loss']} USDT\n- 净收益: {sim_stat['net']} USDT\n"
+        final_report = analysis_result + stat_md
         
         # 发送结果到Telegram
         logger.info("发送分析结果到Telegram")
-        await send_telegram_message_async(analysis_result, as_image=True)
+        await send_telegram_message_async(final_report, as_image=True)
+        # 追加推送最近24小时模拟盘明细（不转图片）
+        sim_24h_md = get_sim_orders_24h()
+        await send_telegram_message_async(sim_24h_md, as_image=False)
         
         logger.info("资金流向分析完成")
         print("资金流向分析已完成并发送到Telegram")
