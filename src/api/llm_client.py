@@ -5,7 +5,7 @@
 import json
 import logging
 import requests
-from typing import Dict
+from typing import Dict, Any
 from ..config import config, LLM_API_PROVIDERS
 from ..analysis.result_manager import get_latest_results
 import numpy as np
@@ -13,6 +13,19 @@ from datetime import datetime
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+# 创建一个自定义JSON编码器，处理numpy类型
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super(NumpyEncoder, self).default(obj)
 
 def call_llm_api(provider: str, prompt: str) -> str:
     """通用LLM API调用函数
@@ -252,13 +265,13 @@ def generate_analysis(data: Dict) -> str:
         
         "以下是市场状态参考信息：\n"
         "1. 交易时间：" + current_time + "\n"
-        "2. 市场整体波动状态：" + ("极度波动" if any(symbol_data.get('futures', {}).get('technical_indicators', {}).get('volatility_20', 0) > 0.05 for symbol_data in simplified_data.values()) else "正常波动") + "\n"
+        "2. 市场整体波动状态：" + ("极度波动" if any(bool(symbol_data.get('futures', {}).get('technical_indicators', {}).get('volatility_20', 0) > 0.05) for symbol_data in simplified_data.values()) else "正常波动") + "\n"
         "3. 市场整体趋势：基于大盘币种趋势判断\n\n"
         
         "此外，如果市场处于极端波动状态（如波动率超过平均值2倍），请更保守地评估并在表格前注明\n\n"
         
         "请使用专业术语，保持分析简洁但深入。所有分析都应基于提供的数据以及技术指标，不需要引入外部市场观点。数据如下：\n\n" +
-        json.dumps(simplified_data, indent=2, ensure_ascii=False) +
+        json.dumps(simplified_data, indent=2, ensure_ascii=False, cls=NumpyEncoder) +
         "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析，不要使用mermaid内容。不用返回主力资金行为部分的内容。"
     )
 

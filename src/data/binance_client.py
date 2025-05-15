@@ -392,8 +392,7 @@ def get_long_short_ratio(symbol: str, period: str = '1h', limit: int = 30) -> Di
             except (AttributeError, BinanceAPIException) as e:
                 logger.warning(f"备用API调用也失败，返回模拟数据: {e}")
                 # 如果两种方法都失败，返回模拟数据
-                from datetime import datetime, timedelta
-                
+                # 确保已导入datetime
                 ratio_data = []
                 current_time = datetime.now()
                 base_ratio = 1.0 + random.uniform(-0.3, 0.3)  # 基准多空比
