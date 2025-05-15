@@ -80,50 +80,53 @@ def generate_analysis(data: Dict) -> str:
     for symbol, symbol_data in data.items():
         simplified_data[symbol] = {
             'spot': {
-                'trend': symbol_data['spot']['trend'],
-                'pressure': symbol_data['spot']['pressure'],
-                'anomalies': symbol_data['spot']['anomalies'][:5] if symbol_data['spot']['anomalies'] else []
+                'trend': symbol_data.get('spot', {}).get('trend', {'direction': 'neutral', 'strength': 0, 'net_inflow': 0}),
+                'pressure': symbol_data.get('spot', {}).get('pressure', {'buy': 0, 'sell': 0, 'ratio': 0}),
+                'anomalies': symbol_data.get('spot', {}).get('anomalies', [])[:5] if symbol_data.get('spot', {}).get('anomalies') else []
             },
             'futures': {
-                'trend': symbol_data['futures']['trend'],
-                'pressure': symbol_data['futures']['pressure'],
-                'anomalies': symbol_data['futures']['anomalies'][:5] if symbol_data['futures']['anomalies'] else []
+                'trend': symbol_data.get('futures', {}).get('trend', {'direction': 'neutral', 'strength': 0, 'net_inflow': 0}),
+                'pressure': symbol_data.get('futures', {}).get('pressure', {'buy': 0, 'sell': 0, 'ratio': 0}),
+                'anomalies': symbol_data.get('futures', {}).get('anomalies', [])[:5] if symbol_data.get('futures', {}).get('anomalies') else []
             }
         }
         
         # 添加订单簿摘要信息
-        if symbol_data['spot']['orderbook']:
+        orderbook = symbol_data.get('spot', {}).get('orderbook', {})
+        if orderbook:
             simplified_data[symbol]['spot']['orderbook_summary'] = {
-                'volume_imbalance': symbol_data['spot']['orderbook'].get('volume_imbalance', 0),
-                'value_imbalance': symbol_data['spot']['orderbook'].get('value_imbalance', 0),
-                'price': symbol_data['spot']['orderbook'].get('price', 0)
+                'volume_imbalance': orderbook.get('volume_imbalance', 0),
+                'value_imbalance': orderbook.get('value_imbalance', 0),
+                'price': orderbook.get('price', 0)
             }
             
-        if symbol_data['futures']['orderbook']:
+        orderbook = symbol_data.get('futures', {}).get('orderbook', {})
+        if orderbook:
             simplified_data[symbol]['futures']['orderbook_summary'] = {
-                'volume_imbalance': symbol_data['futures']['orderbook'].get('volume_imbalance', 0),
-                'value_imbalance': symbol_data['futures']['orderbook'].get('value_imbalance', 0),
-                'price': symbol_data['futures']['orderbook'].get('price', 0)
+                'volume_imbalance': orderbook.get('volume_imbalance', 0),
+                'value_imbalance': orderbook.get('value_imbalance', 0),
+                'price': orderbook.get('price', 0)
             }
             
         # 添加短线交易新增数据
-        if 'spot_short_term' in symbol_data:
+        spot_short_term = symbol_data.get('spot_short_term', {})
+        if spot_short_term:
             # 添加技术指标数据
-            if 'technical_indicators' in symbol_data['spot_short_term']:
-                simplified_data[symbol]['spot']['technical_indicators'] = symbol_data['spot_short_term']['technical_indicators']
+            if 'technical_indicators' in spot_short_term:
+                simplified_data[symbol]['spot']['technical_indicators'] = spot_short_term['technical_indicators']
             
             # 添加支撑阻力数据
-            if 'orderbook' in symbol_data['spot_short_term'] and 'support_resistance' in symbol_data['spot_short_term']['orderbook']:
-                simplified_data[symbol]['spot']['support_resistance'] = symbol_data['spot_short_term']['orderbook']['support_resistance']
+            if spot_short_term.get('orderbook', {}) and 'support_resistance' in spot_short_term.get('orderbook', {}):
+                simplified_data[symbol]['spot']['support_resistance'] = spot_short_term['orderbook']['support_resistance']
             
             # 添加大单交易数据
-            if 'recent_trades' in symbol_data['spot_short_term'] and 'large_order_stats' in symbol_data['spot_short_term']['recent_trades']:
-                simplified_data[symbol]['spot']['large_orders'] = symbol_data['spot_short_term']['recent_trades']['large_order_stats']
+            if spot_short_term.get('recent_trades', {}) and 'large_order_stats' in spot_short_term.get('recent_trades', {}):
+                simplified_data[symbol]['spot']['large_orders'] = spot_short_term['recent_trades']['large_order_stats']
                 
             # 添加波动率指标
-            if 'klines' in symbol_data['spot_short_term'] and '1h' in symbol_data['spot_short_term']['klines']:
+            if spot_short_term.get('klines', {}) and '1h' in spot_short_term.get('klines', {}):
                 # 计算价格波动指标
-                klines_1h = symbol_data['spot_short_term']['klines']['1h']
+                klines_1h = spot_short_term['klines']['1h']
                 if len(klines_1h) > 20:
                     prices = [k['close'] for k in klines_1h[-20:]]
                     volatility = {
@@ -132,35 +135,36 @@ def generate_analysis(data: Dict) -> str:
                     }
                     simplified_data[symbol]['spot']['volatility'] = volatility
         
-        if 'futures_short_term' in symbol_data:
+        futures_short_term = symbol_data.get('futures_short_term', {})
+        if futures_short_term:
             # 添加技术指标数据
-            if 'technical_indicators' in symbol_data['futures_short_term']:
-                simplified_data[symbol]['futures']['technical_indicators'] = symbol_data['futures_short_term']['technical_indicators']
+            if 'technical_indicators' in futures_short_term:
+                simplified_data[symbol]['futures']['technical_indicators'] = futures_short_term['technical_indicators']
             
             # 添加支撑阻力数据
-            if 'orderbook' in symbol_data['futures_short_term'] and 'support_resistance' in symbol_data['futures_short_term']['orderbook']:
-                simplified_data[symbol]['futures']['support_resistance'] = symbol_data['futures_short_term']['orderbook']['support_resistance']
+            if futures_short_term.get('orderbook', {}) and 'support_resistance' in futures_short_term.get('orderbook', {}):
+                simplified_data[symbol]['futures']['support_resistance'] = futures_short_term['orderbook']['support_resistance']
             
             # 添加大单交易数据
-            if 'recent_trades' in symbol_data['futures_short_term'] and 'large_order_stats' in symbol_data['futures_short_term']['recent_trades']:
-                simplified_data[symbol]['futures']['large_orders'] = symbol_data['futures_short_term']['recent_trades']['large_order_stats']
+            if futures_short_term.get('recent_trades', {}) and 'large_order_stats' in futures_short_term.get('recent_trades', {}):
+                simplified_data[symbol]['futures']['large_orders'] = futures_short_term['recent_trades']['large_order_stats']
             
             # 添加资金费率数据
-            if 'funding_rate' in symbol_data['futures_short_term'] and symbol_data['futures_short_term']['funding_rate'].get('stats'):
-                simplified_data[symbol]['futures']['funding_rate'] = symbol_data['futures_short_term']['funding_rate']['stats']
+            if 'funding_rate' in futures_short_term and futures_short_term.get('funding_rate', {}).get('stats'):
+                simplified_data[symbol]['futures']['funding_rate'] = futures_short_term['funding_rate']['stats']
             
             # 添加多空比例数据
-            if 'long_short_ratio' in symbol_data['futures_short_term'] and symbol_data['futures_short_term']['long_short_ratio'].get('stats'):
-                simplified_data[symbol]['futures']['long_short_ratio'] = symbol_data['futures_short_term']['long_short_ratio']['stats']
+            if 'long_short_ratio' in futures_short_term and futures_short_term.get('long_short_ratio', {}).get('stats'):
+                simplified_data[symbol]['futures']['long_short_ratio'] = futures_short_term['long_short_ratio']['stats']
             
             # 添加未平仓合约数据
-            if 'open_interest' in symbol_data['futures_short_term'] and symbol_data['futures_short_term']['open_interest'].get('stats'):
-                simplified_data[symbol]['futures']['open_interest'] = symbol_data['futures_short_term']['open_interest']['stats']
+            if 'open_interest' in futures_short_term and futures_short_term.get('open_interest', {}).get('stats'):
+                simplified_data[symbol]['futures']['open_interest'] = futures_short_term['open_interest']['stats']
                 
             # 添加波动率指标
-            if 'klines' in symbol_data['futures_short_term'] and '1h' in symbol_data['futures_short_term']['klines']:
+            if futures_short_term.get('klines', {}) and '1h' in futures_short_term.get('klines', {}):
                 # 计算价格波动指标
-                klines_1h = symbol_data['futures_short_term']['klines']['1h']
+                klines_1h = futures_short_term['klines']['1h']
                 if len(klines_1h) > 20:
                     prices = [k['close'] for k in klines_1h[-20:]]
                     volatility = {

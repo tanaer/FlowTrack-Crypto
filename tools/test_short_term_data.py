@@ -46,11 +46,93 @@ def main():
             
             # 组装数据
             data[symbol] = {
-                'spot': spot_data,
-                'futures': futures_data,
+                'spot': {
+                    'trend': {
+                        'direction': 'neutral',
+                        'strength': 0,
+                        'net_inflow': 0
+                    },
+                    'pressure': {
+                        'buy': 0,
+                        'sell': 0,
+                        'ratio': 0
+                    },
+                    'anomalies': [],
+                    'orderbook': spot_data.get('orderbook', {}),
+                },
+                'futures': {
+                    'trend': {
+                        'direction': 'neutral',
+                        'strength': 0,
+                        'net_inflow': 0
+                    },
+                    'pressure': {
+                        'buy': 0,
+                        'sell': 0,
+                        'ratio': 0
+                    },
+                    'anomalies': [],
+                    'orderbook': futures_data.get('orderbook', {}),
+                },
                 'spot_short_term': spot_data,
                 'futures_short_term': futures_data
             }
+            
+            # 如果有K线数据，计算基本趋势
+            if spot_data.get('klines', {}).get('1h'):
+                klines = spot_data['klines']['1h']
+                if len(klines) > 10:
+                    # 简单趋势计算：最近10根K线收盘价变化
+                    closes = [k['close'] for k in klines[-10:]]
+                    net_inflow = sum([k['net_inflow'] for k in klines[-10:]])
+                    if closes[-1] > closes[0]:
+                        data[symbol]['spot']['trend'] = {
+                            'direction': 'up',
+                            'strength': (closes[-1] - closes[0]) / closes[0] * 100,
+                            'net_inflow': net_inflow
+                        }
+                    else:
+                        data[symbol]['spot']['trend'] = {
+                            'direction': 'down',
+                            'strength': (closes[0] - closes[-1]) / closes[0] * 100,
+                            'net_inflow': net_inflow
+                        }
+            
+            if futures_data.get('klines', {}).get('1h'):
+                klines = futures_data['klines']['1h']
+                if len(klines) > 10:
+                    # 简单趋势计算：最近10根K线收盘价变化
+                    closes = [k['close'] for k in klines[-10:]]
+                    net_inflow = sum([k['net_inflow'] for k in klines[-10:]])
+                    if closes[-1] > closes[0]:
+                        data[symbol]['futures']['trend'] = {
+                            'direction': 'up',
+                            'strength': (closes[-1] - closes[0]) / closes[0] * 100,
+                            'net_inflow': net_inflow
+                        }
+                    else:
+                        data[symbol]['futures']['trend'] = {
+                            'direction': 'down',
+                            'strength': (closes[0] - closes[-1]) / closes[0] * 100,
+                            'net_inflow': net_inflow
+                        }
+                        
+            # 计算买卖压力
+            if spot_data.get('orderbook'):
+                ob = spot_data['orderbook']
+                data[symbol]['spot']['pressure'] = {
+                    'buy': ob.get('bids_value', 0),
+                    'sell': ob.get('asks_value', 0),
+                    'ratio': ob.get('volume_imbalance', 0)
+                }
+                
+            if futures_data.get('orderbook'):
+                ob = futures_data['orderbook']
+                data[symbol]['futures']['pressure'] = {
+                    'buy': ob.get('bids_value', 0),
+                    'sell': ob.get('asks_value', 0),
+                    'ratio': ob.get('volume_imbalance', 0)
+                }
             
             logger.info(f"{symbol} 数据获取完成")
         
