@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 
 from .config import SYMBOLS, config
-from .data.binance_client import get_klines_data, get_orderbook_stats, client
+from .data.binance_client import get_klines_data, get_orderbook_stats, client, get_short_term_trading_data
 from .analysis.market_analysis import analyze_funding_flow_trend, detect_anomalies, analyze_funding_pressure
 from .api.llm_client import generate_analysis
 from .notification.telegram_sender import send_telegram_message_async
@@ -49,12 +49,12 @@ async def main():
             logger.info(f"开始获取 {symbol} 数据")
             
             # 获取现货K线数据
-            spot_klines = get_klines_data(symbol, interval='5m', limit=200, is_futures=False)
+            spot_klines = get_klines_data(symbol, interval='1h', limit=200, is_futures=False)
             if not spot_klines:
                 logger.warning(f"{symbol} 现货K线数据获取失败")
                 
             # 获取期货K线数据
-            futures_klines = get_klines_data(symbol, interval='5m', limit=200, is_futures=True)
+            futures_klines = get_klines_data(symbol, interval='1h', limit=200, is_futures=True)
             if not futures_klines:
                 logger.warning(f"{symbol} 期货K线数据获取失败")
                 
@@ -74,6 +74,11 @@ async def main():
             spot_pressure = analyze_funding_pressure(spot_klines, spot_orderbook)
             futures_pressure = analyze_funding_pressure(futures_klines, futures_orderbook)
             
+            # 获取短线交易数据
+            logger.info(f"获取 {symbol} 短线交易数据")
+            spot_short_term = get_short_term_trading_data(symbol, is_futures=False)
+            futures_short_term = get_short_term_trading_data(symbol, is_futures=True)
+            
             # 汇总结果
             all_results[symbol] = {
                 'spot': {
@@ -89,7 +94,9 @@ async def main():
                     'trend': futures_trend,
                     'anomalies': futures_anomalies,
                     'pressure': futures_pressure
-                }
+                },
+                'spot_short_term': spot_short_term,
+                'futures_short_term': futures_short_term
             }
             
             logger.info(f"{symbol} 数据处理完成")
