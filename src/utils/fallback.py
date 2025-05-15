@@ -24,20 +24,52 @@ def generate_fallback_analysis(data: Dict) -> str:
     analysis += "## 一、资金行为解读\n\n"
     
     for symbol, symbol_data in data.items():
-        spot_trend = symbol_data['spot']['trend']
-        futures_trend = symbol_data['futures']['trend']
-        spot_pressure = symbol_data['spot']['pressure']
-        futures_pressure = symbol_data['futures']['pressure']
+        # 使用安全获取方法，避免KeyError
+        spot_data = symbol_data.get('spot', {})
+        futures_data = symbol_data.get('futures', {})
+        
+        # 安全获取各种数据，提供默认值防止键不存在
+        spot_trend = get_safe_data(spot_data, 'trend', {})
+        futures_trend = get_safe_data(futures_data, 'trend', {})
+        spot_pressure = get_safe_data(spot_data, 'pressure', {})
+        futures_pressure = get_safe_data(futures_data, 'pressure', {})
+        
+        # 安全获取趋势值和置信度
+        trend_value = get_safe_data(spot_trend, 'trend', '未知')
+        trend_confidence = get_safe_data(spot_trend, 'confidence', 0)
+        futures_trend_value = get_safe_data(futures_trend, 'trend', '未知')
+        futures_trend_confidence = get_safe_data(futures_trend, 'confidence', 0)
+        
+        # 安全获取压力方向和强度
+        spot_pressure_direction = get_safe_data(spot_pressure, 'direction', '未知')
+        spot_pressure_strength = get_safe_data(spot_pressure, 'strength', 0) 
+        futures_pressure_direction = get_safe_data(futures_pressure, 'direction', '未知')
+        futures_pressure_strength = get_safe_data(futures_pressure, 'strength', 0)
         
         analysis += f"### {symbol} 分析\n\n"
-        analysis += f"- **现货趋势**: {spot_trend.get('trend', '未知')}, 置信度: {spot_trend.get('confidence', 0):.2f}\n"
-        analysis += f"- **期货趋势**: {futures_trend.get('trend', '未知')}, 置信度: {futures_trend.get('confidence', 0):.2f}\n"
-        analysis += f"- **现货资金压力**: {spot_pressure.get('direction', '未知')}, 强度: {spot_pressure.get('strength', 0):.2f}\n"
-        analysis += f"- **期货资金压力**: {futures_pressure.get('direction', '未知')}, 强度: {futures_pressure.get('strength', 0):.2f}\n\n"
+        analysis += f"- **现货趋势**: {trend_value}, 置信度: {trend_confidence:.2f}\n"
+        analysis += f"- **期货趋势**: {futures_trend_value}, 置信度: {futures_trend_confidence:.2f}\n"
+        analysis += f"- **现货资金压力**: {spot_pressure_direction}, 强度: {spot_pressure_strength:.2f}\n"
+        analysis += f"- **期货资金压力**: {futures_pressure_direction}, 强度: {futures_pressure_strength:.2f}\n\n"
+        
+        # 处理技术指标
+        spot_technical = get_safe_data(spot_data, 'technical_indicators', {})
+        futures_technical = get_safe_data(futures_data, 'technical_indicators', {})
+        if spot_technical or futures_technical:
+            analysis += "**技术指标**:\n\n"
+            if spot_technical:
+                rsi = get_safe_data(spot_technical, 'rsi_14', '未知')
+                analysis += f"- 现货RSI(14): {rsi if isinstance(rsi, str) else f'{rsi:.2f}'}\n"
+                
+            if futures_technical:
+                rsi = get_safe_data(futures_technical, 'rsi_14', '未知')
+                analysis += f"- 期货RSI(14): {rsi if isinstance(rsi, str) else f'{rsi:.2f}'}\n"
+            
+            analysis += "\n"
         
         # 处理异常情况
-        spot_anomalies = symbol_data['spot'].get('anomalies', [])
-        futures_anomalies = symbol_data['futures'].get('anomalies', [])
+        spot_anomalies = get_safe_data(spot_data, 'anomalies', [])
+        futures_anomalies = get_safe_data(futures_data, 'anomalies', [])
         
         if spot_anomalies or futures_anomalies:
             analysis += "**异常情况**:\n\n"
@@ -56,24 +88,83 @@ def generate_fallback_analysis(data: Dict) -> str:
     
     analysis += "## 二、策略建议\n\n"
     
-    for symbol, symbol_data in data.items():
-        spot_trend = symbol_data['spot']['trend']['trend'] if 'trend' in symbol_data['spot'] and 'trend' in symbol_data['spot']['trend'] else "未知"
-        futures_trend = symbol_data['futures']['trend']['trend'] if 'trend' in symbol_data['futures'] and 'trend' in symbol_data['futures']['trend'] else "未知"
-        
-        analysis += f"### {symbol} 策略\n\n"
-        
-        # 基于趋势提供简单建议
-        if spot_trend == 'rising' and futures_trend == 'rising':
-            analysis += "**建议**: 可考虑逢低做多，注意设置止损\n\n"
-        elif spot_trend == 'falling' and futures_trend == 'falling':
-            analysis += "**建议**: 可考虑逢高做空，注意设置止损\n\n"
-        elif spot_trend == 'consolidation' or futures_trend == 'consolidation':
-            analysis += "**建议**: 目前处于整理阶段，建议观望等待突破\n\n"
-        elif spot_trend == 'top' or futures_trend == 'top':
-            analysis += "**建议**: 可能处于顶部区域，谨慎操作，可考虑减仓\n\n"
-        elif spot_trend == 'bottom' or futures_trend == 'bottom':
-            analysis += "**建议**: 可能处于底部区域，可考虑分批建仓\n\n"
-        else:
-            analysis += "**建议**: 当前趋势不明确，建议观望或轻仓操作\n\n"
+    # 生成交易策略表格
+    analysis += "\n[STRATEGY_TABLE_BEGIN]\n"
+    analysis += "| 交易对 | 类型 | 方向 | 入场 | 止损 | 止盈 | 建议仓位 | 持仓周期 | 信心指数 |\n"
+    analysis += "|--------|------|------|------|------|------|----------|----------|----------|\n"
     
-    return analysis 
+    for symbol, symbol_data in data.items():
+        # 安全获取数据
+        spot_data = symbol_data.get('spot', {})
+        futures_data = symbol_data.get('futures', {})
+        
+        spot_trend_data = get_safe_data(spot_data, 'trend', {})
+        futures_trend_data = get_safe_data(futures_data, 'trend', {})
+        
+        spot_trend = get_safe_data(spot_trend_data, 'trend', 'unknown')
+        futures_trend = get_safe_data(futures_trend_data, 'trend', 'unknown')
+        
+        # 生成模拟交易策略
+        direction = "观望"
+        entry = "-"
+        stop_loss = "-"
+        take_profit = "-"
+        position_size = "0%"
+        holding_period = "-"
+        confidence = 5  # 默认中等自信度
+        
+        # 基于趋势生成简单策略
+        if spot_trend == 'rising' and futures_trend == 'rising':
+            direction = "做多"
+            # 模拟生成一些简单的价格数据用于演示
+            current_price = get_safe_data(symbol_data, 'price', 0)
+            if current_price == 0:
+                # 尝试从orderbook中获取价格
+                orderbook = get_safe_data(spot_data, 'orderbook_summary', {})
+                current_price = get_safe_data(orderbook, 'price', 1000)  # 默认价格如果无法获取
+            
+            # 设置入场、止损和止盈价格
+            entry = f"{current_price:.2f}"
+            stop_loss = f"{current_price * 0.98:.2f}"
+            take_profit = f"{current_price * 1.05:.2f}"
+            position_size = "30%"
+            holding_period = "中线"
+            confidence = 7
+        elif spot_trend == 'falling' and futures_trend == 'falling':
+            direction = "做空"
+            # 模拟生成价格
+            current_price = get_safe_data(symbol_data, 'price', 0)
+            if current_price == 0:
+                orderbook = get_safe_data(spot_data, 'orderbook_summary', {})
+                current_price = get_safe_data(orderbook, 'price', 1000)
+            
+            entry = f"{current_price:.2f}"
+            stop_loss = f"{current_price * 1.02:.2f}"
+            take_profit = f"{current_price * 0.95:.2f}"
+            position_size = "30%"
+            holding_period = "中线"
+            confidence = 7
+        
+        # 添加到表格
+        market_type = "合约" if futures_trend != 'unknown' else "现货"
+        analysis += f"| {symbol} | {market_type} | {direction} | {entry} | {stop_loss} | {take_profit} | {position_size} | {holding_period} | {confidence} |\n"
+    
+    analysis += "[STRATEGY_TABLE_END]\n"
+    
+    return analysis
+
+
+def get_safe_data(data_dict: Dict, key: str, default_value):
+    """安全获取字典中的值，避免KeyError
+    
+    Args:
+        data_dict: 数据字典
+        key: 要获取的键
+        default_value: 键不存在时返回的默认值
+        
+    Returns:
+        键对应的值或默认值
+    """
+    if not isinstance(data_dict, dict):
+        return default_value
+    return data_dict.get(key, default_value) 

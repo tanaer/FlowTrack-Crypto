@@ -6,6 +6,7 @@
 import os
 import sys
 import logging
+import argparse
 from datetime import datetime
 
 # 添加项目根目录到Python路径
@@ -14,23 +15,46 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.data.binance_client import get_short_term_trading_data
 from src.api.llm_client import generate_analysis
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(f"logs/test_short_term_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    ]
-)
+def setup_logging(debug=False):
+    """配置日志级别和格式"""
+    log_level = logging.DEBUG if debug else logging.INFO
+    
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"test_short_term_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
+    # 配置日志
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    
+    # 设置第三方库日志级别为WARNING，减少干扰
+    logging.getLogger("binance").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="测试短线交易数据采集与分析")
+    parser.add_argument('-d', '--debug', action='store_true', help="启用调试日志")
+    parser.add_argument('-s', '--symbols', type=str, default="BTCUSDT,ETHUSDT,SOLUSDT,SUIUSDT", 
+                        help="要分析的交易对列表，用逗号分隔")
+    return parser.parse_args()
 
 def main():
     """主函数"""
+    args = parse_args()
+    logger = setup_logging(args.debug)
+    
     try:
         # 1. 定义要分析的交易对
-        symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT']
+        symbols = args.symbols.split(',')
         logger.info(f"开始获取短线交易数据，交易对: {symbols}")
         
         # 2. 获取短线交易数据

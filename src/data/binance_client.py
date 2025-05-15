@@ -52,10 +52,14 @@ def get_klines_data(symbol: str, interval: str = '1h', limit: int = 200, is_futu
         logger.info(f"正在获取 {symbol} {'期货' if is_futures else '现货'} {interval} K线数据...")
         
         # 根据是否为期货选择不同的API调用
-        if is_futures:
-            data = client.futures_klines(symbol=symbol, interval=interval, limit=limit + 1)
-        else:
-            data = client.get_klines(symbol=symbol, interval=interval, limit=limit + 1)
+        try:
+            if is_futures:
+                data = client.futures_klines(symbol=symbol, interval=interval, limit=limit + 1)
+            else:
+                data = client.get_klines(symbol=symbol, interval=interval, limit=limit + 1)
+        except Exception as e:
+            logger.error(f"获取{symbol} {interval}K线数据API调用失败: {e}")
+            return []
 
         # 检查返回的数据量
         if not data:
@@ -101,10 +105,11 @@ def get_klines_data(symbol: str, interval: str = '1h', limit: int = 200, is_futu
                 'buy_ratio': taker_buy_quote_volume / total_quote_volume if total_quote_volume > 0 else 0,  # 买盘比例
                 'timestamp': k[0]                   # 原始时间戳(毫秒)，用于排序
             })
-
+            
+        logger.debug(f"{symbol} {interval} 数据处理完成，返回 {len(results)} 条记录")
         return results
     except Exception as e:
-        logger.error(f"获取{symbol} K线数据时出错: {str(e)}")
+        logger.error(f"获取{symbol} K线数据时出错: {str(e)}", exc_info=True)
         return []
 
 
@@ -303,11 +308,19 @@ def get_funding_rate(symbol: str, limit: int = 100) -> Dict:
     try:
         logger.info(f"正在获取 {symbol} 资金费率历史...")
         
+        funding_history = None
+        
+        # 尝试API调用
         try:
+            logger.debug(f"尝试使用 futures_funding_rate API")
             funding_history = client.futures_funding_rate(symbol=symbol, limit=limit)
         except (AttributeError, BinanceAPIException) as e:
-            logger.warning(f"API调用获取资金费率失败，使用替代方案: {e}")
-            # 如果API调用失败，使用模拟数据
+            logger.warning(f"API调用获取资金费率失败: {e}")
+            funding_history = None
+        
+        # 如果API调用失败，使用模拟数据
+        if funding_history is None:
+            logger.warning(f"使用模拟资金费率数据")
             funding_history = []
             current_time = datetime.now()
             
@@ -330,10 +343,16 @@ def get_funding_rate(symbol: str, limit: int = 100) -> Dict:
             
             funding_history.reverse()  # 按时间正序排列
         
+        # 确保funding_history不为空
+        if not funding_history:
+            logger.warning(f"无法获取有效数据，返回默认值")
+            return {'history': [], 'stats': None}
+        
+        # 处理数据
         result = []
         for item in funding_history:
             result.append({
-                'symbol': item['symbol'],
+                'symbol': item.get('symbol', symbol),
                 'fundingRate': float(item.get('fundingRate', 0)),
                 'fundingTime': datetime.fromtimestamp(item.get('fundingTime', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S'),
                 'timestamp': item.get('fundingTime', 0)
@@ -380,50 +399,72 @@ def get_long_short_ratio(symbol: str, period: str = '1h', limit: int = 30) -> Di
     try:
         logger.info(f"正在获取 {symbol} 多空持仓比例...")
         
-        # 尝试不同的API调用方法
-        try:
-            # 尝试新的API调用方法
-            ratio_data = client.futures_top_accounts_long_short_ratio(symbol=symbol, period=period, limit=limit)
-        except (AttributeError, BinanceAPIException) as e:
-            logger.warning(f"尝试备用API调用方式获取多空比例: {e}")
-            try:
-                # 尝试备用API方法
-                ratio_data = client.futures_top_longshort_position_ratio(symbol=symbol, period=period, limit=limit)
-            except (AttributeError, BinanceAPIException) as e:
-                logger.warning(f"备用API调用也失败，返回模拟数据: {e}")
-                # 如果两种方法都失败，返回模拟数据
-                # 确保已导入datetime
-                ratio_data = []
-                current_time = datetime.now()
-                base_ratio = 1.0 + random.uniform(-0.3, 0.3)  # 基准多空比
-                
-                for i in range(limit):
-                    time_point = current_time - timedelta(hours=i)
-                    timestamp = int(time_point.timestamp() * 1000)
-                    # 模拟一个略有波动的多空比
-                    ratio = base_ratio + random.uniform(-0.1, 0.1)
-                    long_account = ratio / (1 + ratio)
-                    short_account = 1 - long_account
-                    
-                    ratio_data.append({
-                        'symbol': symbol,
-                        'longShortRatio': ratio,
-                        'longAccount': long_account,
-                        'shortAccount': short_account,
-                        'timestamp': timestamp
-                    })
-                
-                ratio_data.reverse()  # 按时间正序排列
+        top_position_ratio = None
+        top_account_ratio = None
         
+        # 尝试获取持仓比例数据（Top position ratio）
+        try:
+            logger.debug(f"尝试获取 top longshort position ratio")
+            top_position_ratio = client.futures_top_longshort_position_ratio(symbol=symbol, period=period, limit=limit)
+            logger.debug(f"成功获取 top position ratio: {len(top_position_ratio)} 条记录")
+        except (AttributeError, BinanceAPIException) as e:
+            logger.warning(f"获取top longshort position ratio失败: {e}")
+            top_position_ratio = None
+            
+        # 尝试获取账户比例数据（Top account ratio）
+        try:
+            logger.debug(f"尝试获取 top longshort account ratio")
+            top_account_ratio = client.futures_top_longshort_account_ratio(symbol=symbol, period=period, limit=limit)
+            logger.debug(f"成功获取 top account ratio: {len(top_account_ratio)} 条记录")
+        except (AttributeError, BinanceAPIException) as e:
+            logger.warning(f"获取top longshort account ratio失败: {e}")
+            top_account_ratio = None
+            
+        # 优先使用持仓比例数据，其次使用账户比例数据
+        ratio_data = top_position_ratio if top_position_ratio else top_account_ratio
+            
+        # 如果两种API方法都失败，使用模拟数据
+        if ratio_data is None:
+            logger.warning(f"API调用失败，使用模拟数据")
+            
+            # 生成模拟数据
+            ratio_data = []
+            current_time = datetime.now()
+            base_ratio = 1.0 + random.uniform(-0.3, 0.3)  # 基准多空比
+            
+            for i in range(limit):
+                time_point = current_time - timedelta(hours=i)
+                timestamp = int(time_point.timestamp() * 1000)
+                # 模拟一个略有波动的多空比
+                ratio = base_ratio + random.uniform(-0.1, 0.1)
+                long_account = ratio / (1 + ratio)
+                short_account = 1 - long_account
+                
+                ratio_data.append({
+                    'symbol': symbol,
+                    'longShortRatio': ratio,
+                    'longAccount': long_account,
+                    'shortAccount': short_account,
+                    'timestamp': timestamp
+                })
+            
+            ratio_data.reverse()  # 按时间正序排列
+        
+        # 确保ratio_data不为空
+        if not ratio_data:
+            logger.warning(f"无法获取有效数据，返回默认值")
+            return {'data': [], 'stats': None}
+        
+        # 处理数据
         result = []
         for item in ratio_data:
             result.append({
-                'symbol': item['symbol'],
+                'symbol': item.get('symbol', symbol),
                 'longShortRatio': float(item.get('longShortRatio', 0)),
                 'longAccount': float(item.get('longAccount', 0)),
                 'shortAccount': float(item.get('shortAccount', 0)),
-                'timestamp': item['timestamp'],
-                'datetime': datetime.fromtimestamp(item['timestamp'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                'timestamp': item.get('timestamp', 0),
+                'datetime': datetime.fromtimestamp(item.get('timestamp', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S')
             })
         
         # 计算多空比例变化趋势
@@ -482,12 +523,19 @@ def get_open_interest(symbol: str, period: str = '1h', limit: int = 30) -> Dict:
     try:
         logger.info(f"正在获取 {symbol} 未平仓合约量...")
         
+        oi_data = None
+        
+        # 尝试获取未平仓合约历史数据
         try:
-            # 尝试API调用
+            logger.debug(f"尝试使用 futures_open_interest_hist API")
             oi_data = client.futures_open_interest_hist(symbol=symbol, period=period, limit=limit)
         except (AttributeError, BinanceAPIException) as e:
-            logger.warning(f"API调用获取未平仓合约量失败，使用替代方案: {e}")
-            # 如果API调用失败，尝试获取当前未平仓合约数量，然后模拟历史数据
+            logger.warning(f"API调用获取未平仓合约量失败: {e}")
+            oi_data = None
+        
+        # 如果API调用失败，尝试获取当前未平仓合约数量，然后模拟历史数据
+        if oi_data is None:
+            logger.warning(f"尝试获取当前未平仓合约数量并生成历史数据")
             try:
                 # 尝试获取当前未平仓合约数量
                 current_oi = float(client.futures_open_interest(symbol=symbol)['openInterest'])
@@ -518,39 +566,49 @@ def get_open_interest(symbol: str, period: str = '1h', limit: int = 30) -> Dict:
                 oi_data.reverse()  # 按时间正序排列
                 
             except Exception as inner_e:
-                logger.warning(f"无法获取当前未平仓合约数量，生成完全模拟数据: {inner_e}")
-                # 如果获取当前数据也失败，生成完全模拟数据
-                oi_data = []
-                current_time = datetime.now()
-                base_oi = 10000 + random.uniform(-1000, 1000)  # 模拟基准未平仓合约量
-                base_oi_value = base_oi * 100  # 假设价格约为100
-                
-                for i in range(limit):
-                    time_point = current_time - timedelta(hours=i)
-                    timestamp = int(time_point.timestamp() * 1000)
-                    
-                    # 生成略有波动的未平仓合约量
-                    random_factor = 1 + (0.05 * (random.random() - 0.5))
-                    oi = base_oi * random_factor
-                    oi_value = base_oi_value * random_factor
-                    
-                    oi_data.append({
-                        'symbol': symbol,
-                        'sumOpenInterest': oi,
-                        'sumOpenInterestValue': oi_value,
-                        'timestamp': timestamp
-                    })
-                
-                oi_data.reverse()  # 按时间正序排列
+                logger.warning(f"无法获取当前未平仓合约数量: {inner_e}")
+                oi_data = None
         
+        # 如果所有尝试都失败，生成完全模拟数据
+        if oi_data is None:
+            logger.warning(f"使用完全模拟的未平仓合约数据")
+            oi_data = []
+            current_time = datetime.now()
+            base_oi = 10000 + random.uniform(-1000, 1000)  # 模拟基准未平仓合约量
+            base_oi_value = base_oi * 100  # 假设价格约为100
+            
+            for i in range(limit):
+                time_point = current_time - timedelta(hours=i)
+                timestamp = int(time_point.timestamp() * 1000)
+                
+                # 生成略有波动的未平仓合约量
+                random_factor = 1 + (0.05 * (random.random() - 0.5))
+                oi = base_oi * random_factor
+                oi_value = base_oi_value * random_factor
+                
+                oi_data.append({
+                    'symbol': symbol,
+                    'sumOpenInterest': oi,
+                    'sumOpenInterestValue': oi_value,
+                    'timestamp': timestamp
+                })
+            
+            oi_data.reverse()  # 按时间正序排列
+        
+        # 确保oi_data不为空
+        if not oi_data:
+            logger.warning(f"无法获取有效数据，返回默认值")
+            return {'data': [], 'stats': None}
+        
+        # 处理数据
         result = []
         for item in oi_data:
             result.append({
-                'symbol': item['symbol'],
+                'symbol': item.get('symbol', symbol),
                 'sumOpenInterest': float(item.get('sumOpenInterest', 0)),
                 'sumOpenInterestValue': float(item.get('sumOpenInterestValue', 0)),
-                'timestamp': item['timestamp'],
-                'datetime': datetime.fromtimestamp(item['timestamp'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                'timestamp': item.get('timestamp', 0),
+                'datetime': datetime.fromtimestamp(item.get('timestamp', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S')
             })
         
         # 计算未平仓合约量变化
@@ -745,39 +803,431 @@ def get_short_term_trading_data(symbol: str, is_futures: bool = False) -> Dict:
     返回:
         整合的数据字典
     """
-    result = {'symbol': symbol, 'market_type': 'futures' if is_futures else 'spot'}
-    
-    # 1. 获取多个时间周期的K线数据
-    result['klines'] = {}
-    for interval in ['1m', '5m', '15m', '1h']:
-        limit = 200 if interval == '1m' else 100
-        klines = get_klines_data(symbol, interval=interval, limit=limit, is_futures=is_futures)
-        result['klines'][interval] = klines
-    
-    # 2. 获取订单簿数据
-    result['orderbook'] = get_orderbook_stats(symbol, is_futures=is_futures)
-    
-    # 3. 获取最近成交记录
-    recent_trades = get_recent_trades(symbol, is_futures=is_futures)
-    result['recent_trades'] = recent_trades
-    
-    # 只有期货才有以下数据
-    if is_futures:
-        # 4. 获取资金费率数据
-        funding_rate = get_funding_rate(symbol)
-        result['funding_rate'] = funding_rate
+    try:
+        result = {'symbol': symbol, 'market_type': 'futures' if is_futures else 'spot'}
         
-        # 5. 获取多空持仓比例
-        long_short_ratio = get_long_short_ratio(symbol)
-        result['long_short_ratio'] = long_short_ratio
+        # 1. 获取多个时间周期的K线数据，增加数据量到200根
+        result['klines'] = {}
+        for interval in ['1m', '5m', '15m', '1h']:
+            limit = 200  # 所有周期都获取200根K线
+            try:
+                klines = get_klines_data(symbol, interval=interval, limit=limit, is_futures=is_futures)
+                result['klines'][interval] = klines
+                # 为每个周期的K线数据单独计算技术指标
+                if klines and len(klines) >= 20:
+                    technical_indicators = calculate_technical_indicators(klines)
+                    if not result.get('technical_indicators_by_period'):
+                        result['technical_indicators_by_period'] = {}
+                    result['technical_indicators_by_period'][interval] = technical_indicators
+            except Exception as e:
+                logger.error(f"获取 {symbol} {interval} K线数据失败: {e}")
+                result['klines'][interval] = []
         
-        # 6. 获取未平仓合约量
-        open_interest = get_open_interest(symbol)
-        result['open_interest'] = open_interest
+        # 2. 获取订单簿数据
+        try:
+            result['orderbook'] = get_orderbook_stats(symbol, is_futures=is_futures)
+        except Exception as e:
+            logger.error(f"获取 {symbol} 订单簿数据失败: {e}")
+            result['orderbook'] = None
+        
+        # 3. 获取最近成交记录
+        try:
+            recent_trades = get_recent_trades(symbol, is_futures=is_futures)
+            result['recent_trades'] = recent_trades
+            
+            # 增加大单交易分析
+            if recent_trades and len(recent_trades) > 10:
+                large_order_analysis = analyze_large_orders(recent_trades)
+                result['large_order_analysis'] = large_order_analysis
+        except Exception as e:
+            logger.error(f"获取 {symbol} 最近成交记录失败: {e}")
+            result['recent_trades'] = []
+        
+        # 只有期货才有以下数据
+        if is_futures:
+            # 4. 获取资金费率数据
+            try:
+                funding_rate = get_funding_rate(symbol)
+                result['funding_rate'] = funding_rate
+            except Exception as e:
+                logger.error(f"获取 {symbol} 资金费率数据失败: {e}")
+                result['funding_rate'] = None
+            
+            # 5. 获取多空持仓比例 - 处理API兼容性问题
+            try:
+                # 尝试使用新的API方法
+                try:
+                    long_short_ratio = get_long_short_ratio(symbol)
+                except AttributeError:
+                    # 如果新方法不存在，尝试使用旧方法名
+                    logger.info(f"尝试使用备用方法获取 {symbol} 多空比例")
+                    long_short_ratio = get_top_longshort_position_ratio(symbol)
+                    
+                result['long_short_ratio'] = long_short_ratio
+            except Exception as e:
+                logger.error(f"获取 {symbol} 多空比例数据失败: {e}")
+                result['long_short_ratio'] = None
+            
+            # 6. 获取未平仓合约量
+            try:
+                open_interest = get_open_interest(symbol)
+                result['open_interest'] = open_interest
+            except Exception as e:
+                logger.error(f"获取 {symbol} 未平仓合约量失败: {e}")
+                result['open_interest'] = None
+                
+            # 新增：获取大户持仓比例
+            try:
+                top_traders_ratio = get_top_traders_position_ratio(symbol)
+                result['top_traders_ratio'] = top_traders_ratio
+            except Exception as e:
+                logger.error(f"获取 {symbol} 大户持仓比例失败: {e}")
+                result['top_traders_ratio'] = None
+                
+            # 新增：获取标记价格
+            try:
+                mark_price = get_mark_price(symbol)
+                result['mark_price'] = mark_price
+            except Exception as e:
+                logger.error(f"获取 {symbol} 标记价格失败: {e}")
+                result['mark_price'] = None
+                
+            # 新增：获取期货行情数据
+            try:
+                futures_ticker = get_futures_ticker(symbol)
+                result['futures_ticker'] = futures_ticker
+            except Exception as e:
+                logger.error(f"获取 {symbol} 期货行情数据失败: {e}")
+                result['futures_ticker'] = None
+        
+        # 7. 计算技术指标
+        if result['klines'].get('1h') and len(result['klines']['1h']) >= 20:
+            technical_indicators = calculate_technical_indicators(result['klines']['1h'])
+            result['technical_indicators'] = technical_indicators
+        
+        return result
+    except Exception as e:
+        logger.error(f"获取 {symbol} 短线交易数据过程中发生错误: {e}")
+        # 返回一个包含错误信息的基本结构，避免完全中断处理
+        return {
+            'symbol': symbol, 
+            'market_type': 'futures' if is_futures else 'spot',
+            'error': str(e),
+            'klines': {'1m': [], '5m': [], '15m': [], '1h': []},
+            'technical_indicators': {}
+        }
+
+
+def analyze_large_orders(trades: List[Dict]) -> Dict:
+    """分析大单交易
     
-    # 7. 计算技术指标
-    if result['klines']['1h']:
-        technical_indicators = calculate_technical_indicators(result['klines']['1h'])
-        result['technical_indicators'] = technical_indicators
+    参数:
+        trades: 最近成交记录列表
+        
+    返回:
+        大单分析结果
+    """
+    if not trades or len(trades) < 50:
+        return {'error': '数据不足，无法分析大单'}
     
-    return result 
+    try:
+        # 提取成交量
+        volumes = [float(trade['qty']) for trade in trades]
+        
+        # 计算成交量统计数据
+        mean_volume = np.mean(volumes)
+        std_volume = np.std(volumes)
+        
+        # 定义大单阈值（超过2个标准差）
+        large_order_threshold = mean_volume + 2 * std_volume
+        
+        # 筛选大单
+        large_orders = []
+        for trade in trades:
+            volume = float(trade['qty'])
+            if volume > large_order_threshold:
+                large_orders.append({
+                    'time': trade.get('time', 0),
+                    'price': float(trade.get('price', 0)),
+                    'qty': volume,
+                    'is_buyer_maker': trade.get('isBuyerMaker', False),
+                    'std_multiple': (volume - mean_volume) / std_volume if std_volume > 0 else 0
+                })
+        
+        # 分析买入和卖出大单
+        buy_large_orders = [o for o in large_orders if not o['is_buyer_maker']]  # 主动买入
+        sell_large_orders = [o for o in large_orders if o['is_buyer_maker']]  # 主动卖出
+        
+        # 计算大单总量占比
+        large_order_volume = sum(o['qty'] for o in large_orders)
+        total_volume = sum(volumes)
+        volume_percentage = large_order_volume / total_volume if total_volume > 0 else 0
+        
+        return {
+            'large_order_count': len(large_orders),
+            'large_order_threshold': large_order_threshold,
+            'large_order_volume': large_order_volume,
+            'large_order_volume_percentage': volume_percentage,
+            'buy_large_order_count': len(buy_large_orders),
+            'sell_large_order_count': len(sell_large_orders),
+            'buy_large_order_volume': sum(o['qty'] for o in buy_large_orders),
+            'sell_large_order_volume': sum(o['qty'] for o in sell_large_orders),
+            'large_orders': sorted(large_orders, key=lambda x: x['std_multiple'], reverse=True)[:20]  # 返回最大的20个大单
+        }
+    except Exception as e:
+        logger.error(f"分析大单交易失败: {e}")
+        return {'error': f'分析大单交易失败: {e}'}
+
+
+# 兼容API方法
+def get_top_longshort_position_ratio(symbol: str, period: str = '1h', limit: int = 30) -> Dict:
+    """获取大户持仓比例数据 (备用API方法)
+    
+    参数:
+        symbol: 交易对名称
+        period: 时间周期，可选: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
+        limit: 获取的记录数量，最大500
+        
+    返回:
+        大户持仓比例数据
+    """
+    try:
+        logger.info(f"使用备用方法获取 {symbol} 大户持仓比例...")
+        
+        try:
+            # 尝试获取大户持仓比例数据
+            position_ratio = client.futures_top_longshort_position_ratio(symbol=symbol, period=period, limit=limit)
+            
+            if not position_ratio:
+                logger.warning(f"未找到 {symbol} 的大户持仓比例数据")
+                return {'data': [], 'stats': None}
+                
+            # 处理数据结构和统计信息与get_long_short_ratio保持一致
+            result = []
+            for item in position_ratio:
+                result.append({
+                    'symbol': item.get('symbol', symbol),
+                    'longShortRatio': float(item.get('longShortRatio', 0)),
+                    'longPosition': float(item.get('longPosition', 0)),
+                    'shortPosition': float(item.get('shortPosition', 0)),
+                    'timestamp': item.get('timestamp', 0),
+                    'datetime': datetime.fromtimestamp(item.get('timestamp', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                })
+            
+            # 计算持仓比例变化趋势
+            stats = None
+            if len(result) > 1:
+                # 最近一次的多空比变化
+                current_ratio = result[0]['longShortRatio']
+                prev_ratio = result[1]['longShortRatio']
+                ratio_change = current_ratio - prev_ratio
+                
+                # 多空比例的平均值和标准差
+                ratios = [item['longShortRatio'] for item in result]
+                ratio_mean = np.mean(ratios)
+                ratio_std = np.std(ratios)
+                
+                # 判断当前多空比是否处于极端状态
+                is_extreme = abs(current_ratio - ratio_mean) > 2 * ratio_std
+                
+                # 多空趋势
+                ratio_trend = []
+                for i in range(1, len(result)):
+                    ratio_trend.append(result[i-1]['longShortRatio'] - result[i]['longShortRatio'])
+                
+                trend_direction = 'increasing' if np.mean(ratio_trend) > 0 else 'decreasing'
+                
+                stats = {
+                    'current_ratio': current_ratio,
+                    'ratio_change': ratio_change,
+                    'ratio_mean': ratio_mean,
+                    'ratio_std': ratio_std,
+                    'is_extreme': is_extreme,
+                    'trend_direction': trend_direction,
+                    'trend_strength': abs(np.mean(ratio_trend))
+                }
+            
+            return {'data': result, 'stats': stats}
+            
+        except Exception as e:
+            logger.warning(f"获取 {symbol} 备用大户持仓比例数据失败: {e}")
+            return {'data': [], 'stats': None}
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} 大户持仓比例时出错: {e}")
+        return {'data': [], 'stats': None}
+
+
+@sleep_and_retry
+@limits(calls=2, period=1)
+def get_mark_price(symbol: str) -> Dict:
+    """获取标记价格和资金费率
+    
+    参数:
+        symbol: 交易对名称
+        
+    返回:
+        标记价格和资金费率数据
+    """
+    try:
+        logger.info(f"正在获取 {symbol} 标记价格和资金费率...")
+        
+        try:
+            mark_price_data = client.futures_mark_price(symbol=symbol)
+            
+            if isinstance(mark_price_data, list):
+                mark_price_data = next((item for item in mark_price_data if item.get('symbol') == symbol), None)
+                
+            if not mark_price_data:
+                logger.warning(f"未找到 {symbol} 的标记价格数据")
+                return None
+                
+            # 处理数据
+            result = {
+                'symbol': mark_price_data.get('symbol', symbol),
+                'mark_price': float(mark_price_data.get('markPrice', 0)),
+                'index_price': float(mark_price_data.get('indexPrice', 0)),
+                'last_funding_rate': float(mark_price_data.get('lastFundingRate', 0)),
+                'next_funding_time': datetime.fromtimestamp(mark_price_data.get('nextFundingTime', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S') if 'nextFundingTime' in mark_price_data else None,
+                'time': datetime.fromtimestamp(mark_price_data.get('time', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S') if 'time' in mark_price_data else None,
+            }
+            
+            logger.debug(f"成功获取 {symbol} 标记价格数据: {result}")
+            return result
+            
+        except (AttributeError, BinanceAPIException) as e:
+            logger.warning(f"获取 {symbol} 标记价格失败: {e}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} 标记价格时出错: {e}")
+        return None
+
+
+@sleep_and_retry
+@limits(calls=2, period=1)
+def get_futures_ticker(symbol: str) -> Dict:
+    """获取期货24小时价格变化统计
+    
+    参数:
+        symbol: 交易对名称
+        
+    返回:
+        24小时价格变化统计数据
+    """
+    try:
+        logger.info(f"正在获取 {symbol} 期货24小时价格变化统计...")
+        
+        try:
+            ticker_data = client.futures_ticker(symbol=symbol)
+            
+            if isinstance(ticker_data, list):
+                ticker_data = next((item for item in ticker_data if item.get('symbol') == symbol), None)
+                
+            if not ticker_data:
+                logger.warning(f"未找到 {symbol} 的期货行情数据")
+                return None
+                
+            # 处理数据
+            result = {
+                'symbol': ticker_data.get('symbol', symbol),
+                'price_change': float(ticker_data.get('priceChange', 0)),
+                'price_change_percent': float(ticker_data.get('priceChangePercent', 0)),
+                'weighted_avg_price': float(ticker_data.get('weightedAvgPrice', 0)),
+                'last_price': float(ticker_data.get('lastPrice', 0)),
+                'volume': float(ticker_data.get('volume', 0)),
+                'quote_volume': float(ticker_data.get('quoteVolume', 0))
+            }
+            
+            logger.debug(f"成功获取 {symbol} 期货行情数据")
+            return result
+            
+        except (AttributeError, BinanceAPIException) as e:
+            logger.warning(f"获取 {symbol} 期货行情数据失败: {e}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} 期货行情数据时出错: {e}")
+        return None
+
+
+@sleep_and_retry
+@limits(calls=2, period=1)
+def get_top_traders_position_ratio(symbol: str, period: str = '1h', limit: int = 30) -> Dict:
+    """获取大户持仓比例数据
+    
+    参数:
+        symbol: 交易对名称
+        period: 时间周期，可选: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
+        limit: 获取的记录数量，最大500
+        
+    返回:
+        大户持仓比例数据
+    """
+    try:
+        logger.info(f"正在获取 {symbol} 大户持仓比例...")
+        
+        try:
+            # 尝试获取大户持仓比例数据
+            position_ratio = client.futures_top_longshort_position_ratio(symbol=symbol, period=period, limit=limit)
+            
+            if not position_ratio:
+                logger.warning(f"未找到 {symbol} 的大户持仓比例数据")
+                return {'data': [], 'stats': None}
+                
+            # 处理数据
+            result = []
+            for item in position_ratio:
+                result.append({
+                    'symbol': item.get('symbol', symbol),
+                    'longShortRatio': float(item.get('longShortRatio', 0)),
+                    'longPosition': float(item.get('longPosition', 0)),
+                    'shortPosition': float(item.get('shortPosition', 0)),
+                    'timestamp': item.get('timestamp', 0),
+                    'datetime': datetime.fromtimestamp(item.get('timestamp', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                })
+            
+            # 计算持仓比例变化趋势
+            if len(result) > 1:
+                # 最近一次的多空比变化
+                current_ratio = result[0]['longShortRatio']
+                prev_ratio = result[1]['longShortRatio']
+                ratio_change = current_ratio - prev_ratio
+                
+                # 多空比例的平均值和标准差
+                ratios = [item['longShortRatio'] for item in result]
+                ratio_mean = np.mean(ratios)
+                ratio_std = np.std(ratios)
+                
+                # 判断当前多空比是否处于极端状态
+                is_extreme = abs(current_ratio - ratio_mean) > 2 * ratio_std
+                
+                # 多空趋势
+                ratio_trend = []
+                for i in range(1, len(result)):
+                    ratio_trend.append(result[i-1]['longShortRatio'] - result[i]['longShortRatio'])
+                
+                trend_direction = 'increasing' if np.mean(ratio_trend) > 0 else 'decreasing'
+                
+                logger.debug(f"成功获取 {symbol} 大户持仓比例数据: {len(result)} 条记录")
+                return {
+                    'data': result,
+                    'stats': {
+                        'current_ratio': current_ratio,
+                        'ratio_change': ratio_change,
+                        'ratio_mean': ratio_mean,
+                        'ratio_std': ratio_std,
+                        'is_extreme': is_extreme,
+                        'trend': trend_direction
+                    }
+                }
+            
+            return {'data': result, 'stats': None}
+            
+        except (AttributeError, BinanceAPIException) as e:
+            logger.warning(f"获取 {symbol} 大户持仓比例失败: {e}")
+            return {'data': [], 'stats': None}
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} 大户持仓比例时出错: {e}")
+        return {'data': [], 'stats': None} 

@@ -1,72 +1,126 @@
-# Binance资金流向分析工具
+# Binance资金流向分析工具 (FlowTrack-Crypto)
 
 ## 项目简介
 
-这是一个专业的加密货币资金流向分析工具，主要通过分析Binance交易所的现货和期货市场数据，提供深度的市场洞察和交易策略建议。该工具结合K线数据、订单簿深度和DeepSeek AI模型，为交易者提供全面的市场分析。
+这是一个专业的加密货币资金流向分析工具，主要通过分析Binance交易所的现货和期货市场数据，提供深度的市场洞察和交易策略建议。该工具结合多周期K线数据、技术指标分析、订单簿热力图和AI分析，为交易者提供全面的短线交易策略。
 
 ## 主要功能
 
-1. **资金流向分析**
+1. **多周期K线数据分析**
+   - 收集1分钟/5分钟/15分钟/1小时 × 200根K线数据
+   - 对比不同时间周期的走势，识别趋势的强弱和持续性
+   - 多周期技术指标协同确认，提高预测准确性
+
+2. **丰富的技术指标分析**
+   - RSI超买超卖判断及背离识别
+   - MACD金叉死叉及柱状图分析
+   - 布林带宽度和价格位置分析
+   - ATR波动率监测及移动平均线系统分析
+   - 各指标的多周期数据协同研判
+
+3. **订单簿热力图与支撑阻力分析**
+   - 分析价格区间内订单分布热力图
+   - 自动识别关键支撑/阻力位强度
+   - 计算买卖盘不平衡度
+   - 分析关键价格区间内的买卖盘压力
+
+4. **大单交易监控与分析**
+   - 识别超过两个标准差的大单交易
+   - 分析大单流向（买入/卖出）及其影响
+   - 统计大单占比和平均规模
+   - 追踪大单后市场的反应情况
+
+5. **资金流向分析**
    - 分析现货和期货市场的资金流入/流出趋势
    - 识别主力资金的建仓、出货行为
    - 对比不同交易对的资金流向差异
+   - 期货资金费率极值分析
 
-2. **市场阶段判断**
-   - 自动判断市场所处阶段（顶部、底部、上涨中、下跌中、整理中）
-   - 提供判断的置信度和具体依据
-   - 分析不同交易对之间可能存在的轮动关系
+6. **多空情绪监控**
+   - 期货市场多空持仓比例及趋势分析
+   - 大户持仓比例监控
+   - 未平仓合约变化趋势分析
+   - 检测极端市场情绪状态
 
-3. **订单簿深度分析**
-   - 计算买卖盘不平衡度
-   - 分析关键价格区间内的买卖盘压力
-   - 结合资金流向评估市场压力方向和强度
-
-4. **异常交易检测**
-   - 识别成交量异常但价格变化不大的情况
-   - 检测价格异常波动但成交量不高的情况
-   - 发现极端资金净流入/流出的异常交易
-
-5. **AI驱动的专业分析**
+7. **AI驱动的专业分析**
    - 通过DeepSeek API提供专业交易员视角的市场解读
-   - 生成短期趋势预判和交易策略建议
+   - 生成针对性的短线交易策略（做多/做空/观望）
+   - 提供精确入场点、止损点、止盈点
+   - 建议仓位大小和持仓周期，并附带信心指数
    - 输出结构化的markdown格式分析报告
+
+8. **模拟交易与绩效跟踪**
+   - 自动解析AI策略并模拟下单
+   - 统计模拟交易胜率和盈亏情况
+   - 记录24小时内的最新模拟订单状态
+   - 长期跟踪模拟交易表现进行自我优化
 
 ## 技术特点
 
-- **多维度数据采集**：同时分析现货和期货市场数据，提供更全面的市场视角
-- **高级统计分析**：使用相关性分析、线性回归等方法挖掘市场趋势
-- **领先/滞后关系分析**：研究资金流向与价格变化之间的时间关系
-- **异常值检测**：使用统计方法识别可能的市场操纵行为
-- **API速率限制处理**：内置请求限流机制，确保稳定运行
+- **健壮的错误处理**：多层错误处理机制，确保程序稳定运行
+- **安全数据处理**：NumPy类型的JSON序列化兼容，避免数据转换问题
+- **API兼容性**：自动尝试备用API方法，解决Binance API更新带来的兼容性问题
+- **流量控制**：内置请求限流机制，确保不超过API限制
+- **灵活配置**：通过命令行参数控制运行模式和分析范围
+- **详细日志**：分级日志系统，便于问题诊断
+- **定时执行**：支持每小时自动执行分析，维持数据更新
 
-## 使用方法
+## 命令行参数
 
-1. **配置API密钥**
-   - 设置Binance API密钥和密钥（`BINANCE_API_KEY`和`BINANCE_API_SECRET`）
-   - 设置DeepSeek API密钥（`DEEPSEEK_API_KEY`）
+```bash
+python -m run [参数选项]
+```
 
-2. **设置监控交易对**
-   - 在`SYMBOLS`列表中添加或修改需要监控的交易对
+参数选项:
+- `--dry-run`: 运行但不发送结果到Telegram，适合测试模式
+- `--debug`: 启用调试模式，显示更详细的日志，并保存原始数据
+- `--no-schedule`: 仅运行一次，不设置定时任务
+- `--symbols`: 指定要分析的交易对，以逗号分隔，例如: "BTCUSDT,ETHUSDT"
 
-3. **运行分析**
-   ```
-   python binance_funding_flow_analyzer.py
-   ```
+使用示例:
+```bash
+# 仅分析BTC和ETH，不发送到Telegram
+python -m run --symbols BTCUSDT,ETHUSDT --dry-run
 
-4. **查看结果**
-   - 分析结果将输出到控制台
-   - 同时保存为markdown文件（`binance_analysis.md`）
+# 调试模式，仅运行一次
+python -m run --debug --no-schedule
+
+# 正常模式，每小时定时执行
+python -m run
+```
+
+## 安装与设置
+
+1. **安装依赖**
+```bash
+pip install -r requirements.txt
+```
+
+2. **配置文件设置**
+创建`config.ini`文件并填写以下内容:
+```ini
+[API]
+BINANCE_API_KEY = 你的Binance API KEY
+BINANCE_API_SECRET = 你的Binance API SECRET
+DEEPSEEK_API_KEY = 你的DeepSeek API KEY
+DEEPSEEK_API_URL = https://api.deepseek.com/v1
+DEEPSEEK_API_MODEL = deepseek-chat
+
+[TELEGRAM]
+BOT_TOKEN = 你的Telegram Bot Token
+CHAT_ID = 你的Telegram聊天ID
+
+[GENERAL]
+LOG_LEVEL = INFO
+```
+
+3. **设置监控交易对**
+在`src/config.py`中修改`SYMBOLS`列表。
 
 ## 系统要求
 
 - Python 3.7+
-- 依赖库：requests, pandas, numpy, scipy, binance-python, telegram, ratelimit
-
-## 安装依赖
-
-```bash
-pip install requests pandas numpy scipy python-binance python-telegram-bot ratelimit
-```
+- 依赖库：requests, pandas, numpy, scipy, python-binance, python-telegram-bot, ratelimit
 
 ## 注意事项
 
@@ -74,13 +128,7 @@ pip install requests pandas numpy scipy python-binance python-telegram-bot ratel
 2. 分析结果仅供参考，不构成投资建议
 3. 请遵守Binance API使用条款，避免过于频繁的请求
 4. DeepSeek API调用会产生费用，请合理使用
-
-## 未来计划
-
-- 添加更多交易所数据源
-- 实现自动交易策略执行
-- 开发Web界面展示分析结果
-- 增加更多技术指标和分析维度
+5. 模拟交易仅作为策略评估工具，不会在交易所实际下单
 
 ## 免责声明
 
