@@ -905,6 +905,18 @@ def get_short_term_trading_data(symbol: str, is_futures: bool = False) -> Dict:
             technical_indicators = calculate_technical_indicators(result['klines']['1h'])
             result['technical_indicators'] = technical_indicators
         
+        # 添加最新市场价格
+        try:
+            # 获取最新的市场价格（不受K线剔除影响）
+            if is_futures:
+                current_price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+            else:
+                current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+            result['current_market_price'] = current_price
+            logger.info(f"获取 {symbol} 最新市场价格: {current_price}")
+        except Exception as e:
+            logger.error(f"获取 {symbol} 最新市场价格失败: {e}")
+        
         return result
     except Exception as e:
         logger.error(f"获取 {symbol} 短线交易数据过程中发生错误: {e}")

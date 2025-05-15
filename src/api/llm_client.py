@@ -2,6 +2,7 @@
 
 负责调用外部LLM API进行分析生成。
 """
+from http import client
 import json
 import logging
 import requests
@@ -109,12 +110,14 @@ def generate_analysis(data: Dict) -> str:
                 'spot': {
                     'trend': spot_data.get('trend', {'direction': 'neutral', 'strength': 0, 'net_inflow': 0}),
                     'pressure': spot_data.get('pressure', {'buy': 0, 'sell': 0, 'ratio': 0}),
-                    'anomalies': spot_data.get('anomalies', [])[:5] if spot_data.get('anomalies') else []
+                    'anomalies': spot_data.get('anomalies', [])[:5] if spot_data.get('anomalies') else [],
+                    'current_market_price': spot_data.get('current_market_price', 0)
                 },
                 'futures': {
                     'trend': futures_data.get('trend', {'direction': 'neutral', 'strength': 0, 'net_inflow': 0}),
                     'pressure': futures_data.get('pressure', {'buy': 0, 'sell': 0, 'ratio': 0}),
-                    'anomalies': futures_data.get('anomalies', [])[:5] if futures_data.get('anomalies') else []
+                    'anomalies': futures_data.get('anomalies', [])[:5] if futures_data.get('anomalies') else [],
+                    'current_market_price': futures_data.get('current_market_price', 0)
                 }
             }
             
@@ -345,22 +348,41 @@ def generate_analysis(data: Dict) -> str:
             "\n\n回复格式要求：中文，使用markdown格式，重点突出，适当使用表格对比分析，不要使用mermaid内容。"
         )
 
+        # 添加每个交易对的最新价格信息
+        for symbol, symbol_data in simplified_data.items():
+            spot_price = symbol_data.get('spot', {}).get('current_market_price', 0)
+            futures_price = symbol_data.get('futures', {}).get('current_market_price', 0)
+            current_price = futures_price or spot_price
+            if current_price > 0:
+                prompt += f"- {symbol}: 当前价格 {current_price}\n"
+        
+        prompt += "\n交易策略中的入场价必须接近当前市场价格，否则策略将无法执行。\n"
+
         # 按配置顺序依次尝试各个API
         for provider in LLM_API_PROVIDERS:
             try:
                 if provider == 'local':
                     logger.info("使用本地分析生成结果")
                     from ..utils.fallback import generate_fallback_analysis
-                    return generate_fallback_analysis(simplified_data)
+                    result = generate_fallback_analysis(simplified_data)
+                    # 验证策略价格与市场价格的一致性
+                    result = validate_strategy_prices(result, simplified_data)
+                    return result
                 else:
-                    return call_llm_api(provider, prompt)
+                    result = call_llm_api(provider, prompt)
+                    # 验证策略价格与市场价格的一致性
+                    result = validate_strategy_prices(result, simplified_data)
+                    return result
             except Exception as e:
                 logger.error(f"{provider} API调用失败: {e}")
                 if provider == LLM_API_PROVIDERS[-1]:
                     # 如果是最后一个提供商也失败，则生成本地分析
                     logger.warning("所有配置的API都调用失败，使用本地分析")
                     from ..utils.fallback import generate_fallback_analysis
-                    return generate_fallback_analysis(simplified_data)
+                    result = generate_fallback_analysis(simplified_data)
+                    # 验证策略价格与市场价格的一致性
+                    result = validate_strategy_prices(result, simplified_data)
+                    return result
                 else:
                     # 否则继续尝试下一个提供商
                     logger.info(f"尝试下一个API提供商: {LLM_API_PROVIDERS[LLM_API_PROVIDERS.index(provider) + 1]}")
@@ -369,3 +391,38 @@ def generate_analysis(data: Dict) -> str:
         logger.error(f"生成分析过程中发生错误: {e}")
         # 在发生异常时返回基本的错误报告
         return f"# 系统生成分析时发生错误\n\n抱歉，在生成分析报告时遇到了问题: {str(e)}\n\n请查看日志获取详细信息。" 
+
+
+def validate_strategy_prices(analysis_result: str, market_data: Dict) -> str:
+    """验证策略中的价格是否与市场价格相符，如果偏差过大则添加警告"""
+    if "[STRATEGY_TABLE_BEGIN]" in analysis_result and "[STRATEGY_TABLE_END]" in analysis_result:
+        table_start = analysis_result.find("[STRATEGY_TABLE_BEGIN]")
+        table_end = analysis_result.find("[STRATEGY_TABLE_END]") + len("[STRATEGY_TABLE_END]")
+        table = analysis_result[table_start:table_end]
+        
+        warning_msg = "\n\n## ⚠️ 价格偏差警告\n\n"
+        has_warning = False
+        
+        for symbol, data in market_data.items():
+            current_price = data.get('futures', {}).get('current_market_price') or data.get('spot', {}).get('current_market_price')
+            if not current_price:
+                continue
+                
+            if symbol in table:
+                import re
+                # 查找该交易对的入场价
+                pattern = rf"\|\s*{symbol}\s*\|\s*[^|]+\|\s*[^|]+\|\s*([0-9.]+)\s*\|"
+                match = re.search(pattern, table)
+                if match:
+                    entry_price = float(match.group(1))
+                    diff_pct = abs(entry_price - current_price) / current_price * 100
+                    
+                    if diff_pct > 1.5:  # 如果偏差超过1.5%
+                        has_warning = True
+                        warning_msg += f"- {symbol}: 策略入场价 {entry_price} 与当前市场价 {current_price} 偏差 {diff_pct:.2f}%\n"
+        
+        if has_warning:
+            # 在表格后添加警告信息
+            return analysis_result[:table_end] + warning_msg + analysis_result[table_end:]
+    
+    return analysis_result 
